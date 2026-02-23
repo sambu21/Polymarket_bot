@@ -1,6 +1,6 @@
 import asyncio
 
-from db import connect_db
+from db import connect_db, init_db
 from signal_engine import monitor
 from websocket_listener import listen
 
@@ -8,6 +8,7 @@ TOKEN_TO_MONITOR = "REPLACE_WITH_REAL_TOKEN_ID"
 
 async def main():
     pool = await connect_db()
+    await init_db(pool)
 
     tasks = []
     tasks.append(listen(pool))

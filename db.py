@@ -57,6 +57,71 @@ async def insert_trade(pool, token_id, price, size, timestamp):
     except Exception as exc:
         print(f"DB insert failed: {exc}")
 
+async def init_db(pool):
+    if pool is None:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS market_volume_snapshots (
+                    market_id TEXT NOT NULL,
+                    volume_24h NUMERIC NOT NULL,
+                    observed_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (market_id, observed_at)
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS volume_spikes (
+                    market_id TEXT NOT NULL,
+                    question TEXT,
+                    delta NUMERIC NOT NULL,
+                    window_seconds INTEGER NOT NULL,
+                    observed_at TIMESTAMPTZ NOT NULL
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS volume_spikes_market_time_idx
+                ON volume_spikes(market_id, observed_at DESC);
+                """
+            )
+    except Exception as exc:
+        print(f"DB init failed: {exc}")
+
+async def insert_volume_snapshot(pool, market_id, volume_24h, observed_at):
+    if pool is None:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO market_volume_snapshots(market_id, volume_24h, observed_at)
+                VALUES($1, $2, $3)
+                """,
+                market_id, volume_24h, observed_at
+            )
+    except Exception as exc:
+        print(f"DB insert snapshot failed: {exc}")
+
+async def insert_volume_spike(pool, market_id, question, delta, window_seconds, observed_at):
+    if pool is None:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO volume_spikes(market_id, question, delta, window_seconds, observed_at)
+                VALUES($1, $2, $3, $4, $5)
+                """,
+                market_id, question, delta, window_seconds, observed_at
+            )
+    except Exception as exc:
+        print(f"DB insert spike failed: {exc}")
+
 async def get_recent_volume(pool, token_id, minutes=2):
     if pool is None:
         return 0
