@@ -1,0 +1,238 @@
+:root {
+  color-scheme: light;
+  --bg: #0e1116;
+  --bg-accent: #1b2231;
+  --card: rgba(255, 255, 255, 0.06);
+  --card-strong: rgba(255, 255, 255, 0.12);
+  --text: #f5f7fb;
+  --muted: #b4bccb;
+  --accent: #26c2a0;
+  --hot: #ff7b4a;
+  --line: rgba(255, 255, 255, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Space Grotesk", system-ui, sans-serif;
+  background:
+    radial-gradient(800px 500px at 15% 10%, rgba(38, 194, 160, 0.18), transparent 60%),
+    radial-gradient(900px 700px at 85% 20%, rgba(255, 123, 74, 0.15), transparent 60%),
+    linear-gradient(180deg, #0a0d12 0%, #121722 100%);
+  color: var(--text);
+}
+
+.app {
+  min-height: 100vh;
+  padding: 32px 40px 64px;
+}
+
+.hero {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 32px;
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02));
+  backdrop-filter: blur(12px);
+}
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--muted);
+  margin: 0 0 12px;
+  font-size: 12px;
+}
+
+h1 {
+  margin: 0 0 12px;
+  font-size: 36px;
+  line-height: 1.1;
+}
+
+.subhead {
+  margin: 0;
+  color: var(--muted);
+  max-width: 520px;
+}
+
+.status {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  margin-right: 8px;
+  background: #777;
+}
+
+.dot.live {
+  background: var(--accent);
+  box-shadow: 0 0 12px rgba(38, 194, 160, 0.8);
+}
+
+.dot.connecting,
+.dot.reconnecting {
+  background: #f6d061;
+}
+
+.dot.error {
+  background: #ff5b5b;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 20px;
+  margin-top: 28px;
+}
+
+.card {
+  padding: 20px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  transition: transform 0.2s ease, border-color 0.2s ease;
+}
+
+.card.hot {
+  border-color: rgba(255, 123, 74, 0.8);
+  box-shadow: 0 12px 30px rgba(255, 123, 74, 0.15);
+  transform: translateY(-2px);
+}
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.card h2 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.pill {
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+
+.label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.value {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.large-trade {
+  padding-top: 12px;
+  border-top: 1px dashed var(--line);
+  display: grid;
+  gap: 8px;
+}
+
+.trade-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.stream {
+  margin-top: 36px;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  padding: 18px 22px;
+}
+
+.stream-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.stream-list {
+  display: grid;
+  gap: 10px;
+}
+
+.stream-row {
+  display: grid;
+  grid-template-columns: 110px 1.6fr 120px 160px 120px;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+
+.stream-row:last-child {
+  border-bottom: none;
+}
+
+.stream-empty {
+  color: var(--muted);
+  padding: 12px 0;
+}
+
+.mono {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.truncate {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 960px) {
+  .hero {
+    flex-direction: column;
+  }
+
+  .stream-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .app {
+    padding: 20px;
+  }
+
+  h1 {
+    font-size: 28px;
+  }
+}

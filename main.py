@@ -3,6 +3,7 @@ import asyncio
 from db import connect_db, init_db
 from signal_engine import monitor
 from websocket_listener import listen
+from clob_trade_listener import listen_large_trades
 
 TOKEN_TO_MONITOR = "REPLACE_WITH_REAL_TOKEN_ID"
 
@@ -12,6 +13,7 @@ async def main():
 
     tasks = []
     tasks.append(listen(pool))
+    tasks.append(listen_large_trades(pool))
 
     if TOKEN_TO_MONITOR and TOKEN_TO_MONITOR != "REPLACE_WITH_REAL_TOKEN_ID":
         tasks.append(monitor(pool, TOKEN_TO_MONITOR))

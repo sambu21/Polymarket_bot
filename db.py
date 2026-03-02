@@ -89,6 +89,27 @@ async def init_db(pool):
                 ON volume_spikes(market_id, observed_at DESC);
                 """
             )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS large_trades (
+                    asset_id TEXT NOT NULL,
+                    market_id TEXT,
+                    question TEXT,
+                    outcome TEXT,
+                    side TEXT,
+                    price NUMERIC NOT NULL,
+                    size NUMERIC NOT NULL,
+                    notional NUMERIC NOT NULL,
+                    observed_at TIMESTAMPTZ NOT NULL
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS large_trades_market_time_idx
+                ON large_trades(market_id, observed_at DESC);
+                """
+            )
     except Exception as exc:
         print(f"DB init failed: {exc}")
 
@@ -121,6 +142,23 @@ async def insert_volume_spike(pool, market_id, question, delta, window_seconds, 
             )
     except Exception as exc:
         print(f"DB insert spike failed: {exc}")
+
+async def insert_large_trade(pool, asset_id, market_id, question, outcome, side, price, size, notional, observed_at):
+    if pool is None:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO large_trades(
+                    asset_id, market_id, question, outcome, side, price, size, notional, observed_at
+                )
+                VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                """,
+                asset_id, market_id, question, outcome, side, price, size, notional, observed_at
+            )
+    except Exception as exc:
+        print(f"DB insert large trade failed: {exc}")
 
 async def get_recent_volume(pool, token_id, minutes=2):
     if pool is None:
