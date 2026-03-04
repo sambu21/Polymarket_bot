@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+backend/.venv/
+frontend/.venv/
+
+# Node / frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+
+# Local env and temp data
+.env
+markets.json
+*.log
