@@ -15,7 +15,8 @@ python -m venv .venv
 pip install -r backend\requirements.txt
 
 $env:FRONTEND_ORIGIN="http://localhost:5173"
-$env:DASH_TOP_N="50"
+$env:DASH_TOP_N="500"
+$env:DASH_MIN_TOP_N="200"
 $env:TRADE_ABS_MIN_SIZE="1000"
 $env:TRADE_SIZE_MULTIPLIER="6"
 $env:TRADE_SIZE_WINDOW="50"

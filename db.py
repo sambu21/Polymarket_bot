@@ -178,3 +178,55 @@ async def get_recent_volume(pool, token_id, minutes=2):
     except Exception as exc:
         print(f"DB query failed: {exc}")
         return 0
+
+
+async def get_large_trades_for_market(pool, market_id, limit=50, offset=0):
+    if pool is None:
+        return []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    asset_id,
+                    market_id,
+                    question,
+                    outcome,
+                    side,
+                    price,
+                    size,
+                    notional,
+                    observed_at
+                FROM large_trades
+                WHERE market_id = $1
+                ORDER BY observed_at DESC
+                LIMIT $2
+                OFFSET $3
+                """,
+                market_id,
+                limit,
+                offset,
+            )
+            result = []
+            for row in rows:
+                ts = row["observed_at"]
+                iso = ts.isoformat()
+                if iso.endswith("+00:00"):
+                    iso = iso[:-6] + "Z"
+                result.append(
+                    {
+                        "asset_id": row["asset_id"],
+                        "market_id": row["market_id"],
+                        "question": row["question"],
+                        "outcome": row["outcome"],
+                        "side": row["side"],
+                        "price": float(row["price"] or 0),
+                        "size": float(row["size"] or 0),
+                        "notional": float(row["notional"] or 0),
+                        "timestamp": iso,
+                    }
+                )
+            return result
+    except Exception as exc:
+        print(f"DB large trade query failed: {exc}")
+        return []
