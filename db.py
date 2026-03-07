@@ -110,6 +110,22 @@ async def init_db(pool):
                 ON large_trades(market_id, observed_at DESC);
                 """
             )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGSERIAL PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS users_email_idx
+                ON users(email);
+                """
+            )
     except Exception as exc:
         print(f"DB init failed: {exc}")
 
@@ -230,3 +246,55 @@ async def get_large_trades_for_market(pool, market_id, limit=50, offset=0):
     except Exception as exc:
         print(f"DB large trade query failed: {exc}")
         return []
+
+
+async def get_user_by_email(pool, email):
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, email, password_hash, created_at
+                FROM users
+                WHERE email = $1
+                """,
+                (email or "").strip().lower(),
+            )
+            if not row:
+                return None
+            return {
+                "id": int(row["id"]),
+                "email": row["email"],
+                "password_hash": row["password_hash"],
+                "created_at": row["created_at"].isoformat(),
+            }
+    except Exception as exc:
+        print(f"DB get user failed: {exc}")
+        return None
+
+
+async def create_user(pool, email, password_hash):
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO users(email, password_hash)
+                VALUES($1, $2)
+                RETURNING id, email, created_at
+                """,
+                (email or "").strip().lower(),
+                password_hash,
+            )
+            if not row:
+                return None
+            return {
+                "id": int(row["id"]),
+                "email": row["email"],
+                "created_at": row["created_at"].isoformat(),
+            }
+    except Exception as exc:
+        print(f"DB create user failed: {exc}")
+        return None

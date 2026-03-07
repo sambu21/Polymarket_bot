@@ -1,4 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { clearAuthToken, getAuthToken } from "./auth";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 const POLL_MS = 20000;
@@ -7,6 +9,7 @@ const MARKET_PAGE_SIZE = 25;
 const MARKET_HISTORY_PAGE_SIZE = 25;
 const STREAM_MAX_EVENTS = 100;
 const ALL_CATEGORIES = "__all__";
+const DEFAULT_MIN_LARGE_TRADE_USDC = 5000;
 
 function fmtNumber(value) {
   if (value === null || value === undefined) return "-";
@@ -63,6 +66,10 @@ function tradeKey(trade) {
   return `${trade.market_id}-${trade.asset_id}-${trade.timestamp}-${trade.side}-${trade.size}`;
 }
 
+function tradeNotional(trade) {
+  return Number(trade?.notional || 0);
+}
+
 function normalizeCategory(value) {
   if (value === null || value === undefined) return null;
   const text = String(value).trim();
@@ -97,23 +104,26 @@ function defaultHistoryState() {
 }
 
 export default function App() {
+  const navigate = useNavigate();
+  const authToken = getAuthToken();
   const [markets, setMarkets] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedCategory, setSelectedCategory] = useState(ALL_CATEGORIES);
   const [updatedAt, setUpdatedAt] = useState(null);
   const [wsStatus, setWsStatus] = useState("connecting");
   const [largeTrades, setLargeTrades] = useState([]);
+  const [minLargeTradeUsdc, setMinLargeTradeUsdc] = useState(DEFAULT_MIN_LARGE_TRADE_USDC);
   const [visibleCount, setVisibleCount] = useState(MARKET_PAGE_SIZE);
   const [selectedMarketId, setSelectedMarketId] = useState(null);
   const [marketHistoryById, setMarketHistoryById] = useState({});
-  const lastLargeByMarketRef = useRef({});
 
   useEffect(() => {
     let isMounted = true;
 
     async function fetchMarkets() {
       try {
-        const res = await fetch(`${API_BASE}/api/markets`);
+        const headers = authToken ? { Authorization: `Bearer ${authToken}` } : {};
+        const res = await fetch(`${API_BASE}/api/markets`, { headers });
         const data = await res.json();
         if (!isMounted) return;
         setMarkets(data.markets || []);
@@ -131,7 +141,7 @@ export default function App() {
       isMounted = false;
       clearInterval(id);
     };
-  }, []);
+  }, [authToken]);
 
   useEffect(() => {
     setVisibleCount(MARKET_PAGE_SIZE);
@@ -151,7 +161,9 @@ export default function App() {
 
     function connect() {
       setWsStatus("connecting");
-      ws = new WebSocket(API_BASE.replace("http", "ws") + "/ws/large-trades");
+      const wsBase = API_BASE.replace(/^http/, "ws");
+      const suffix = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
+      ws = new WebSocket(`${wsBase}/ws/large-trades${suffix}`);
 
       ws.onopen = () => {
         setWsStatus("live");
@@ -163,7 +175,6 @@ export default function App() {
           const payload = JSON.parse(event.data);
           setLargeTrades((prev) => [payload, ...prev].slice(0, STREAM_MAX_EVENTS));
           if (payload.market_id) {
-            lastLargeByMarketRef.current[payload.market_id] = payload;
             setMarketHistoryById((prev) => {
               const current = prev[payload.market_id];
               if (!current) return prev;
@@ -201,13 +212,27 @@ export default function App() {
       stopped = true;
       if (ws) ws.close();
     };
-  }, []);
+  }, [authToken]);
+
+  const qualifiedLargeTrades = useMemo(() => {
+    return largeTrades.filter((trade) => tradeNotional(trade) >= minLargeTradeUsdc);
+  }, [largeTrades, minLargeTradeUsdc]);
+
+  const latestQualifiedTradeByMarket = useMemo(() => {
+    const byMarket = new Map();
+    qualifiedLargeTrades.forEach((trade) => {
+      const id = String(trade.market_id || "");
+      if (!id || byMarket.has(id)) return;
+      byMarket.set(id, trade);
+    });
+    return byMarket;
+  }, [qualifiedLargeTrades]);
 
   const enrichedMarkets = useMemo(() => {
     return markets.map((m) => {
       const prices = parseOutcomePrices(m.outcomes, m.outcomePrices);
       const id = marketKey(m);
-      const lastLarge = lastLargeByMarketRef.current[id];
+      const lastLarge = latestQualifiedTradeByMarket.get(id);
       const category = normalizeCategory(m.category);
       const categoryKey = toCategoryKey(m.categorySlug || category);
       return {
@@ -219,7 +244,7 @@ export default function App() {
         lastLarge,
       };
     });
-  }, [markets, largeTrades]);
+  }, [markets, latestQualifiedTradeByMarket]);
 
   const categoryOptions = useMemo(() => {
     const counts = new Map();
@@ -243,6 +268,29 @@ export default function App() {
     return enrichedMarkets.filter((market) => market.categoryKey === selectedCategory);
   }, [enrichedMarkets, selectedCategory]);
 
+  const activeCategoryLabel = useMemo(() => {
+    if (selectedCategory === ALL_CATEGORIES) return "All";
+    const selected = categoryOptions.find((option) => option.key === selectedCategory);
+    return selected?.label || "Unknown";
+  }, [categoryOptions, selectedCategory]);
+
+  const marketCategoryById = useMemo(() => {
+    const map = new Map();
+    enrichedMarkets.forEach((market) => {
+      if (!market._key || !market.categoryKey) return;
+      map.set(market._key, market.categoryKey);
+    });
+    return map;
+  }, [enrichedMarkets]);
+
+  const filteredLargeTrades = useMemo(() => {
+    if (selectedCategory === ALL_CATEGORIES) return qualifiedLargeTrades;
+    return qualifiedLargeTrades.filter((trade) => {
+      const tradeCategory = marketCategoryById.get(String(trade.market_id || ""));
+      return tradeCategory === selectedCategory;
+    });
+  }, [qualifiedLargeTrades, marketCategoryById, selectedCategory]);
+
   const filteredMarkets = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return marketsByCategory;
@@ -263,6 +311,9 @@ export default function App() {
   const selectedHistory = selectedMarketId
     ? marketHistoryById[selectedMarketId] || defaultHistoryState()
     : defaultHistoryState();
+  const selectedHistoryVisibleItems = useMemo(() => {
+    return selectedHistory.items.filter((trade) => tradeNotional(trade) >= minLargeTradeUsdc);
+  }, [selectedHistory, minLargeTradeUsdc]);
 
   const loadMarketHistory = useCallback(async (marketId, append = false) => {
     if (!marketId) return;
@@ -282,7 +333,10 @@ export default function App() {
 
     try {
       const res = await fetch(
-        `${API_BASE}/api/markets/${encodeURIComponent(marketId)}/large-trades?limit=${MARKET_HISTORY_PAGE_SIZE}&offset=${requestOffset}`
+        `${API_BASE}/api/markets/${encodeURIComponent(marketId)}/large-trades?limit=${MARKET_HISTORY_PAGE_SIZE}&offset=${requestOffset}`,
+        {
+          headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+        }
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -318,7 +372,7 @@ export default function App() {
         };
       });
     }
-  }, []);
+  }, [authToken]);
 
   function handleSelectMarket(market) {
     const id = market._key;
@@ -327,7 +381,7 @@ export default function App() {
 
     setMarketHistoryById((prev) => {
       if (prev[id]) return prev;
-      const seed = largeTrades.filter((t) => t.market_id === id).slice(0, MARKET_HISTORY_PAGE_SIZE);
+      const seed = qualifiedLargeTrades.filter((t) => t.market_id === id).slice(0, MARKET_HISTORY_PAGE_SIZE);
       return {
         ...prev,
         [id]: {
@@ -366,6 +420,28 @@ export default function App() {
           <div>
             <span>Updated: {updatedAt ? new Date(updatedAt).toLocaleTimeString() : "-"}</span>
           </div>
+          <div>
+            {authToken ? (
+              <button
+                type="button"
+                className="btn"
+                onClick={() => {
+                  clearAuthToken();
+                  window.location.reload();
+                }}
+              >
+                Logout
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn"
+                onClick={() => navigate("/login")}
+              >
+                Login / Register
+              </button>
+            )}
+          </div>
         </div>
       </header>
 
@@ -377,6 +453,17 @@ export default function App() {
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
         />
+        <label className="min-usdc-control">
+          <span>Min large trade (USDC)</span>
+          <input
+            className="min-usdc-input"
+            type="number"
+            min="0"
+            step="100"
+            value={minLargeTradeUsdc}
+            onChange={(e) => setMinLargeTradeUsdc(Math.max(0, Number(e.target.value || 0)))}
+          />
+        </label>
         <span className="results-count">
           {visibleMarkets.length} of {filteredMarkets.length} shown
         </span>
@@ -450,13 +537,13 @@ export default function App() {
           <div className="market-history">
             <div className="stream-header">
               <h3>Large Trade History</h3>
-              <span>{selectedHistory.items.length} loaded</span>
+              <span>{selectedHistoryVisibleItems.length} shown</span>
             </div>
             <div className="stream-list">
-              {selectedHistory.items.length === 0 && !selectedHistory.loading && (
-                <div className="stream-empty">No large trades stored for this market yet.</div>
+              {selectedHistoryVisibleItems.length === 0 && !selectedHistory.loading && (
+                <div className="stream-empty">No trades meet the minimum USDC threshold yet.</div>
               )}
-              {selectedHistory.items.map((trade, idx) => (
+              {selectedHistoryVisibleItems.map((trade, idx) => (
                 <div className="stream-row" key={`${tradeKey(trade)}-${idx}`}>
                   <span className="mono">{new Date(trade.timestamp).toLocaleString()}</span>
                   <span className="truncate">{trade.question || selectedMarket.question}</span>
@@ -566,8 +653,9 @@ export default function App() {
       <section className="stream">
         <div className="stream-header">
           <h3>Latest Large Trades</h3>
-          <span>{largeTrades.length} events</span>
+          <span>{filteredLargeTrades.length} events</span>
         </div>
+        <div className="active-filter">Active filter: {activeCategoryLabel}</div>
         <div className="stream-col-header" aria-hidden="true">
           <span className="mono">Time - execution timestamp</span>
           <span>Market - question traded</span>
@@ -576,8 +664,8 @@ export default function App() {
           <span className="mono">Notional - total USDC value</span>
         </div>
         <div className="stream-list">
-          {largeTrades.length === 0 && <div className="stream-empty">Waiting for large trades...</div>}
-          {largeTrades.map((trade, idx) => (
+          {filteredLargeTrades.length === 0 && <div className="stream-empty">No large trades for this filter yet.</div>}
+          {filteredLargeTrades.map((trade, idx) => (
             <div className="stream-row" key={`${trade.asset_id}-${trade.timestamp}-${idx}`}>
               <span className="mono">{new Date(trade.timestamp).toLocaleTimeString()}</span>
               <span className="truncate">{trade.question}</span>

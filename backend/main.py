@@ -1,22 +1,38 @@
 import asyncio
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Set
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel
 
 from .clob_streamer import LargeTradeStream, TokenMapCache
 try:
-    from db import connect_db, get_large_trades_for_market, init_db, insert_large_trade
+    from db import (
+        connect_db,
+        create_user,
+        get_large_trades_for_market,
+        get_user_by_email,
+        init_db,
+        insert_large_trade,
+    )
 except Exception:
     connect_db = None
+    create_user = None
     get_large_trades_for_market = None
+    get_user_by_email = None
     init_db = None
     insert_large_trade = None
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY", "change-this-secret")
+AUTH_ALGORITHM = "HS256"
+AUTH_EXPIRE_HOURS = int(os.getenv("AUTH_EXPIRE_HOURS", "168"))
 
 app = FastAPI(title="Polymarket Monitor API")
 app.add_middleware(
@@ -29,6 +45,50 @@ app.add_middleware(
 
 cache = TokenMapCache()
 db_pool = None
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+class AuthPayload(BaseModel):
+    email: str
+    password: str
+
+
+def _normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _issue_access_token(user: dict) -> str:
+    exp = datetime.now(timezone.utc) + timedelta(hours=AUTH_EXPIRE_HOURS)
+    payload = {
+        "sub": user["email"],
+        "uid": str(user["id"]),
+        "exp": exp,
+    }
+    return jwt.encode(payload, AUTH_SECRET_KEY, algorithm=AUTH_ALGORITHM)
+
+
+async def _current_user_from_token(token: str) -> dict:
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing auth token")
+    try:
+        payload = jwt.decode(token, AUTH_SECRET_KEY, algorithms=[AUTH_ALGORITHM])
+        email = _normalize_email(payload.get("sub"))
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid auth token")
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid auth token")
+    if db_pool is None or get_user_by_email is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    user = await get_user_by_email(db_pool, email)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+async def require_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)) -> dict:
+    token = credentials.credentials if credentials else ""
+    return await _current_user_from_token(token)
 
 
 class WebSocketHub:
@@ -219,6 +279,67 @@ async def on_shutdown() -> None:
 @app.get("/api/health")
 async def health() -> dict:
     return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
+
+
+@app.post("/api/auth/register")
+async def auth_register(payload: AuthPayload) -> dict:
+    if db_pool is None or create_user is None or get_user_by_email is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    email = _normalize_email(payload.email)
+    password = payload.password or ""
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="Invalid email")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    existing = await get_user_by_email(db_pool, email)
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    password_hash = pwd_context.hash(password)
+    created = await create_user(db_pool, email, password_hash)
+    if not created:
+        raise HTTPException(status_code=500, detail="Could not create user")
+
+    token = _issue_access_token(created)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": created["id"],
+            "email": created["email"],
+        },
+    }
+
+
+@app.post("/api/auth/login")
+async def auth_login(payload: AuthPayload) -> dict:
+    if db_pool is None or get_user_by_email is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    email = _normalize_email(payload.email)
+    user = await get_user_by_email(db_pool, email)
+    if not user or not pwd_context.verify(payload.password or "", user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = _issue_access_token(user)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+        },
+    }
+
+
+@app.get("/api/auth/me")
+async def auth_me(user: dict = Depends(require_user)) -> dict:
+    return {
+        "id": user["id"],
+        "email": user["email"],
+    }
 
 
 @app.get("/api/markets")
