@@ -126,6 +126,51 @@ async def init_db(pool):
                 ON users(email);
                 """
             )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    default_category_slug TEXT,
+                    min_large_trade_usdc NUMERIC NOT NULL DEFAULT 5000,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_bookmarks (
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    market_id TEXT NOT NULL,
+                    question TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (user_id, market_id)
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS user_bookmarks_user_created_idx
+                ON user_bookmarks(user_id, created_at DESC);
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_market_alerts (
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    market_id TEXT NOT NULL,
+                    min_notional_usdc NUMERIC NOT NULL DEFAULT 5000,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (user_id, market_id)
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS user_market_alerts_user_enabled_idx
+                ON user_market_alerts(user_id, enabled);
+                """
+            )
     except Exception as exc:
         print(f"DB init failed: {exc}")
 
@@ -215,6 +260,7 @@ async def get_large_trades_for_market(pool, market_id, limit=50, offset=0):
                     observed_at
                 FROM large_trades
                 WHERE market_id = $1
+                AND observed_at >= NOW() - INTERVAL '48 hours'
                 ORDER BY observed_at DESC
                 LIMIT $2
                 OFFSET $3
@@ -246,6 +292,269 @@ async def get_large_trades_for_market(pool, market_id, limit=50, offset=0):
     except Exception as exc:
         print(f"DB large trade query failed: {exc}")
         return []
+
+
+async def purge_old_large_trades(pool, retention_hours=48):
+    if pool is None:
+        return 0
+    try:
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM large_trades
+                WHERE observed_at < NOW() - ($1::text || ' hours')::interval
+                """,
+                int(retention_hours),
+            )
+            # result format: "DELETE <count>"
+            deleted = int(str(result).split()[-1])
+            return deleted
+    except Exception as exc:
+        print(f"DB purge old large trades failed: {exc}")
+        return 0
+
+
+async def get_recent_large_trades(pool, limit=100):
+    if pool is None:
+        return []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    asset_id,
+                    market_id,
+                    question,
+                    outcome,
+                    side,
+                    price,
+                    size,
+                    notional,
+                    observed_at
+                FROM large_trades
+                WHERE observed_at >= NOW() - INTERVAL '48 hours'
+                ORDER BY observed_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+            result = []
+            for row in rows:
+                ts = row["observed_at"]
+                iso = ts.isoformat()
+                if iso.endswith("+00:00"):
+                    iso = iso[:-6] + "Z"
+                result.append(
+                    {
+                        "asset_id": row["asset_id"],
+                        "market_id": row["market_id"],
+                        "question": row["question"],
+                        "outcome": row["outcome"],
+                        "side": row["side"],
+                        "price": float(row["price"] or 0),
+                        "size": float(row["size"] or 0),
+                        "notional": float(row["notional"] or 0),
+                        "timestamp": iso,
+                    }
+                )
+            return result
+    except Exception as exc:
+        print(f"DB recent large trades query failed: {exc}")
+        return []
+
+
+async def get_user_preferences(pool, user_id):
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT default_category_slug, min_large_trade_usdc
+                FROM user_preferences
+                WHERE user_id = $1
+                """,
+                user_id,
+            )
+            if not row:
+                return None
+            return {
+                "default_category_slug": row["default_category_slug"],
+                "min_large_trade_usdc": float(row["min_large_trade_usdc"] or 5000),
+            }
+    except Exception as exc:
+        print(f"DB get user preferences failed: {exc}")
+        return None
+
+
+async def upsert_user_preferences(pool, user_id, default_category_slug, min_large_trade_usdc):
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_preferences(user_id, default_category_slug, min_large_trade_usdc, updated_at)
+                VALUES($1, $2, $3, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET default_category_slug = EXCLUDED.default_category_slug,
+                    min_large_trade_usdc = EXCLUDED.min_large_trade_usdc,
+                    updated_at = NOW()
+                RETURNING default_category_slug, min_large_trade_usdc
+                """,
+                user_id,
+                default_category_slug,
+                float(min_large_trade_usdc),
+            )
+            if not row:
+                return None
+            return {
+                "default_category_slug": row["default_category_slug"],
+                "min_large_trade_usdc": float(row["min_large_trade_usdc"] or 5000),
+            }
+    except Exception as exc:
+        print(f"DB upsert user preferences failed: {exc}")
+        return None
+
+
+async def list_user_bookmarks(pool, user_id):
+    if pool is None:
+        return []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT market_id, question, created_at
+                FROM user_bookmarks
+                WHERE user_id = $1
+                ORDER BY created_at DESC
+                """,
+                user_id,
+            )
+            return [
+                {
+                    "market_id": row["market_id"],
+                    "question": row["question"],
+                    "created_at": row["created_at"].isoformat(),
+                }
+                for row in rows
+            ]
+    except Exception as exc:
+        print(f"DB list bookmarks failed: {exc}")
+        return []
+
+
+async def add_user_bookmark(pool, user_id, market_id, question):
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO user_bookmarks(user_id, market_id, question)
+                VALUES($1, $2, $3)
+                ON CONFLICT (user_id, market_id) DO UPDATE
+                SET question = EXCLUDED.question
+                """,
+                user_id,
+                market_id,
+                question,
+            )
+            return True
+    except Exception as exc:
+        print(f"DB add bookmark failed: {exc}")
+        return False
+
+
+async def remove_user_bookmark(pool, user_id, market_id):
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM user_bookmarks
+                WHERE user_id = $1 AND market_id = $2
+                """,
+                user_id,
+                market_id,
+            )
+            return True
+    except Exception as exc:
+        print(f"DB remove bookmark failed: {exc}")
+        return False
+
+
+async def list_user_alerts(pool, user_id):
+    if pool is None:
+        return []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT market_id, min_notional_usdc, enabled, updated_at
+                FROM user_market_alerts
+                WHERE user_id = $1
+                ORDER BY updated_at DESC
+                """,
+                user_id,
+            )
+            return [
+                {
+                    "market_id": row["market_id"],
+                    "min_notional_usdc": float(row["min_notional_usdc"] or 0),
+                    "enabled": bool(row["enabled"]),
+                    "updated_at": row["updated_at"].isoformat(),
+                }
+                for row in rows
+            ]
+    except Exception as exc:
+        print(f"DB list alerts failed: {exc}")
+        return []
+
+
+async def upsert_user_alert(pool, user_id, market_id, min_notional_usdc, enabled=True):
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO user_market_alerts(user_id, market_id, min_notional_usdc, enabled, updated_at)
+                VALUES($1, $2, $3, $4, NOW())
+                ON CONFLICT (user_id, market_id) DO UPDATE
+                SET min_notional_usdc = EXCLUDED.min_notional_usdc,
+                    enabled = EXCLUDED.enabled,
+                    updated_at = NOW()
+                """,
+                user_id,
+                market_id,
+                float(min_notional_usdc),
+                bool(enabled),
+            )
+            return True
+    except Exception as exc:
+        print(f"DB upsert alert failed: {exc}")
+        return False
+
+
+async def remove_user_alert(pool, user_id, market_id):
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM user_market_alerts
+                WHERE user_id = $1 AND market_id = $2
+                """,
+                user_id,
+                market_id,
+            )
+            return True
+    except Exception as exc:
+        print(f"DB remove alert failed: {exc}")
+        return False
 
 
 async def get_user_by_email(pool, email):

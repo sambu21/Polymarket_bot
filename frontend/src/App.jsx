@@ -116,6 +116,10 @@ export default function App() {
   const [visibleCount, setVisibleCount] = useState(MARKET_PAGE_SIZE);
   const [selectedMarketId, setSelectedMarketId] = useState(null);
   const [marketHistoryById, setMarketHistoryById] = useState({});
+  const [userProfile, setUserProfile] = useState(null);
+  const [bookmarksByMarketId, setBookmarksByMarketId] = useState({});
+  const [alertsByMarketId, setAlertsByMarketId] = useState({});
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -134,7 +138,22 @@ export default function App() {
       }
     }
 
+    async function fetchRecentLargeTrades() {
+      try {
+        const headers = authToken ? { Authorization: `Bearer ${authToken}` } : {};
+        const res = await fetch(`${API_BASE}/api/large-trades?limit=${STREAM_MAX_EVENTS}`, { headers });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!isMounted) return;
+        const fetched = Array.isArray(data.trades) ? data.trades : [];
+        setLargeTrades((prev) => mergeUniqueTrades(fetched, prev).slice(0, STREAM_MAX_EVENTS));
+      } catch {
+        // ignore
+      }
+    }
+
     fetchMarkets();
+    fetchRecentLargeTrades();
     const id = setInterval(fetchMarkets, POLL_MS);
 
     return () => {
@@ -146,6 +165,71 @@ export default function App() {
   useEffect(() => {
     setVisibleCount(MARKET_PAGE_SIZE);
   }, [searchQuery, selectedCategory]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadUserState() {
+      if (!authToken) {
+        setUserProfile(null);
+        setBookmarksByMarketId({});
+        setAlertsByMarketId({});
+        setPrefsLoaded(false);
+        return;
+      }
+
+      const headers = { Authorization: `Bearer ${authToken}` };
+      try {
+        const [meRes, prefsRes, bookmarksRes, alertsRes] = await Promise.all([
+          fetch(`${API_BASE}/api/auth/me`, { headers }),
+          fetch(`${API_BASE}/api/user/preferences`, { headers }),
+          fetch(`${API_BASE}/api/user/bookmarks`, { headers }),
+          fetch(`${API_BASE}/api/user/alerts`, { headers }),
+        ]);
+        if (cancelled) return;
+
+        if (meRes.ok) {
+          setUserProfile(await meRes.json());
+        }
+        if (prefsRes.ok) {
+          const prefs = await prefsRes.json();
+          if (typeof prefs.min_large_trade_usdc === "number") {
+            setMinLargeTradeUsdc(Math.max(0, prefs.min_large_trade_usdc));
+          }
+          if (prefs.default_category_slug) {
+            setSelectedCategory(String(prefs.default_category_slug).toLowerCase());
+          }
+        }
+        if (bookmarksRes.ok) {
+          const data = await bookmarksRes.json();
+          const map = {};
+          (data.bookmarks || []).forEach((bookmark) => {
+            map[String(bookmark.market_id)] = bookmark;
+          });
+          setBookmarksByMarketId(map);
+        }
+        if (alertsRes.ok) {
+          const data = await alertsRes.json();
+          const map = {};
+          (data.alerts || []).forEach((alert) => {
+            map[String(alert.market_id)] = alert;
+          });
+          setAlertsByMarketId(map);
+        }
+      } catch {
+        // ignore
+      } finally {
+        if (!cancelled) {
+          setPrefsLoaded(true);
+        }
+      }
+    }
+
+    loadUserState();
+    return () => {
+      cancelled = true;
+    };
+  }, [authToken]);
 
   useEffect(() => {
     if (!selectedMarketId) return;
@@ -291,6 +375,15 @@ export default function App() {
     });
   }, [qualifiedLargeTrades, marketCategoryById, selectedCategory]);
 
+  const alertMatches = useMemo(() => {
+    if (!authToken) return [];
+    return filteredLargeTrades.filter((trade) => {
+      const alert = alertsByMarketId[String(trade.market_id || "")];
+      if (!alert || alert.enabled === false) return false;
+      return tradeNotional(trade) >= Number(alert.min_notional_usdc || 0);
+    });
+  }, [alertsByMarketId, authToken, filteredLargeTrades]);
+
   const filteredMarkets = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return marketsByCategory;
@@ -397,7 +490,117 @@ export default function App() {
     }
   }
 
+  async function toggleBookmark(market) {
+    if (!authToken) {
+      navigate("/login");
+      return;
+    }
+    const marketId = market._key;
+    const exists = Boolean(bookmarksByMarketId[marketId]);
+    const headers = {
+      Authorization: `Bearer ${authToken}`,
+      "Content-Type": "application/json",
+    };
+    if (exists) {
+      const res = await fetch(`${API_BASE}/api/user/bookmarks/${encodeURIComponent(marketId)}`, {
+        method: "DELETE",
+        headers,
+      });
+      if (!res.ok) return;
+      setBookmarksByMarketId((prev) => {
+        const next = { ...prev };
+        delete next[marketId];
+        return next;
+      });
+      return;
+    }
+    const res = await fetch(`${API_BASE}/api/user/bookmarks`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        market_id: marketId,
+        question: market.question || null,
+      }),
+    });
+    if (!res.ok) return;
+    setBookmarksByMarketId((prev) => ({
+      ...prev,
+      [marketId]: {
+        market_id: marketId,
+        question: market.question || null,
+      },
+    }));
+  }
+
+  async function upsertAlert(marketId, minNotionalUsdc, enabled = true) {
+    if (!authToken) {
+      navigate("/login");
+      return;
+    }
+    const headers = {
+      Authorization: `Bearer ${authToken}`,
+      "Content-Type": "application/json",
+    };
+    const minNotional = Math.max(0, Number(minNotionalUsdc || 0));
+    const res = await fetch(`${API_BASE}/api/user/alerts`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        market_id: marketId,
+        min_notional_usdc: minNotional,
+        enabled,
+      }),
+    });
+    if (!res.ok) return;
+    setAlertsByMarketId((prev) => ({
+      ...prev,
+      [marketId]: {
+        market_id: marketId,
+        min_notional_usdc: minNotional,
+        enabled,
+      },
+    }));
+  }
+
+  async function removeAlert(marketId) {
+    if (!authToken) {
+      navigate("/login");
+      return;
+    }
+    const headers = { Authorization: `Bearer ${authToken}` };
+    const res = await fetch(`${API_BASE}/api/user/alerts/${encodeURIComponent(marketId)}`, {
+      method: "DELETE",
+      headers,
+    });
+    if (!res.ok) return;
+    setAlertsByMarketId((prev) => {
+      const next = { ...prev };
+      delete next[marketId];
+      return next;
+    });
+  }
+
   const canLoadMoreMarkets = visibleMarkets.length < filteredMarkets.length;
+
+  useEffect(() => {
+    if (!authToken || !prefsLoaded) return;
+    const headers = {
+      Authorization: `Bearer ${authToken}`,
+      "Content-Type": "application/json",
+    };
+    const body = JSON.stringify({
+      default_category_slug: selectedCategory === ALL_CATEGORIES ? null : selectedCategory,
+      min_large_trade_usdc: minLargeTradeUsdc,
+    });
+    const timer = setTimeout(() => {
+      fetch(`${API_BASE}/api/user/preferences`, {
+        method: "PUT",
+        headers,
+        body,
+      }).catch(() => {});
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [authToken, minLargeTradeUsdc, prefsLoaded, selectedCategory]);
 
   return (
     <div className="app">
@@ -419,6 +622,9 @@ export default function App() {
           </div>
           <div>
             <span>Updated: {updatedAt ? new Date(updatedAt).toLocaleTimeString() : "-"}</span>
+          </div>
+          <div>
+            {authToken ? <span className="auth-user">{userProfile?.email || "Signed in"}</span> : null}
           </div>
           <div>
             {authToken ? (
@@ -559,6 +765,38 @@ export default function App() {
             </div>
             {selectedHistory.error && <div className="history-error">{selectedHistory.error}</div>}
             <div className="history-actions">
+              {selectedMarket && (
+                <div className="alert-config">
+                  <span className="label">Alert Threshold (USDC)</span>
+                  <input
+                    className="min-usdc-input"
+                    type="number"
+                    min="0"
+                    step="100"
+                    value={Number(alertsByMarketId[selectedMarket._key]?.min_notional_usdc || minLargeTradeUsdc)}
+                    onChange={(e) =>
+                      upsertAlert(
+                        selectedMarket._key,
+                        Number(e.target.value || 0),
+                        true
+                      )
+                    }
+                  />
+                  {alertsByMarketId[selectedMarket._key] ? (
+                    <button className="btn" type="button" onClick={() => removeAlert(selectedMarket._key)}>
+                      Disable Alert
+                    </button>
+                  ) : (
+                    <button
+                      className="btn"
+                      type="button"
+                      onClick={() => upsertAlert(selectedMarket._key, minLargeTradeUsdc, true)}
+                    >
+                      Enable Alert
+                    </button>
+                  )}
+                </div>
+              )}
               <button
                 className="btn"
                 type="button"
@@ -578,6 +816,7 @@ export default function App() {
           const minutes = lastLarge ? minutesAgo(lastLarge.timestamp) : null;
           const isHot = minutes !== null && minutes <= ALERT_RECENT_MIN;
           const isSelected = selectedMarketId && market._key === selectedMarketId;
+          const isBookmarked = Boolean(bookmarksByMarketId[market._key]);
           return (
             <article
               key={market._key || market.id}
@@ -594,9 +833,21 @@ export default function App() {
             >
               <div className="card-header">
                 <h2>{market.question || "Unknown market"}</h2>
-                <span className="pill">
-                  {market.endDate ? new Date(market.endDate).toLocaleDateString() : "No end"}
-                </span>
+                <div className="card-header-actions">
+                  <button
+                    type="button"
+                    className={`pill-btn ${isBookmarked ? "active" : ""}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleBookmark(market);
+                    }}
+                  >
+                    {isBookmarked ? "Bookmarked" : "Bookmark"}
+                  </button>
+                  <span className="pill">
+                    {market.endDate ? new Date(market.endDate).toLocaleDateString() : "No end"}
+                  </span>
+                </div>
               </div>
               <div className="metrics">
                 <div>
@@ -656,6 +907,9 @@ export default function App() {
           <span>{filteredLargeTrades.length} events</span>
         </div>
         <div className="active-filter">Active filter: {activeCategoryLabel}</div>
+        {authToken && (
+          <div className="active-filter">Alert matches: {alertMatches.length}</div>
+        )}
         <div className="stream-col-header" aria-hidden="true">
           <span className="mono">Time - execution timestamp</span>
           <span>Market - question traded</span>
@@ -680,6 +934,30 @@ export default function App() {
           ))}
         </div>
       </section>
+      {authToken && (
+        <section className="stream">
+          <div className="stream-header">
+            <h3>Alert Matches</h3>
+            <span>{alertMatches.length} events</span>
+          </div>
+          <div className="stream-list">
+            {alertMatches.length === 0 && <div className="stream-empty">No alert matches yet.</div>}
+            {alertMatches.slice(0, 20).map((trade, idx) => (
+              <div className="stream-row" key={`alert-${trade.asset_id}-${trade.timestamp}-${idx}`}>
+                <span className="mono">{new Date(trade.timestamp).toLocaleTimeString()}</span>
+                <span className="truncate">{trade.question}</span>
+                <span className="mono">
+                  {trade.outcome} {trade.side}
+                </span>
+                <span className="mono">
+                  {fmtNumber(trade.size)} @ {Number(trade.price).toFixed(3)}
+                </span>
+                <span className="mono">{fmtNumber(trade.notional)} USDC</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
     </div>
   );
 }
