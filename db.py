@@ -171,6 +171,36 @@ async def init_db(pool):
                 ON user_market_alerts(user_id, enabled);
                 """
             )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_wallets (
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    wallet_address TEXT NOT NULL,
+                    verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+                    PRIMARY KEY (user_id, wallet_address)
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS user_wallets_primary_unique_idx
+                ON user_wallets(user_id)
+                WHERE is_primary = TRUE;
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_wallet_nonces (
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    wallet_address TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (user_id, wallet_address)
+                );
+                """
+            )
     except Exception as exc:
         print(f"DB init failed: {exc}")
 
@@ -304,7 +334,7 @@ async def purge_old_large_trades(pool, retention_hours=48):
                 DELETE FROM large_trades
                 WHERE observed_at < NOW() - ($1::text || ' hours')::interval
                 """,
-                int(retention_hours),
+                str(int(retention_hours)),
             )
             # result format: "DELETE <count>"
             deleted = int(str(result).split()[-1])
@@ -554,6 +584,189 @@ async def remove_user_alert(pool, user_id, market_id):
             return True
     except Exception as exc:
         print(f"DB remove alert failed: {exc}")
+        return False
+
+
+async def get_user_wallets(pool, user_id):
+    if pool is None:
+        return []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT wallet_address, verified_at, is_primary
+                FROM user_wallets
+                WHERE user_id = $1
+                ORDER BY is_primary DESC, verified_at DESC
+                """,
+                user_id,
+            )
+            return [
+                {
+                    "wallet_address": row["wallet_address"],
+                    "verified_at": row["verified_at"].isoformat(),
+                    "is_primary": bool(row["is_primary"]),
+                }
+                for row in rows
+            ]
+    except Exception as exc:
+        print(f"DB get wallets failed: {exc}")
+        return []
+
+
+async def upsert_wallet_nonce(pool, user_id, wallet_address, nonce, expires_at):
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO user_wallet_nonces(user_id, wallet_address, nonce, expires_at, created_at)
+                VALUES($1, $2, $3, $4, NOW())
+                ON CONFLICT (user_id, wallet_address) DO UPDATE
+                SET nonce = EXCLUDED.nonce,
+                    expires_at = EXCLUDED.expires_at,
+                    created_at = NOW()
+                """,
+                user_id,
+                wallet_address,
+                nonce,
+                expires_at,
+            )
+            return True
+    except Exception as exc:
+        print(f"DB upsert wallet nonce failed: {exc}")
+        return False
+
+
+async def consume_wallet_nonce(pool, user_id, wallet_address, nonce):
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM user_wallet_nonces
+                WHERE user_id = $1
+                  AND wallet_address = $2
+                  AND nonce = $3
+                  AND expires_at > NOW()
+                """,
+                user_id,
+                wallet_address,
+                nonce,
+            )
+            deleted = int(str(result).split()[-1])
+            return deleted > 0
+    except Exception as exc:
+        print(f"DB consume wallet nonce failed: {exc}")
+        return False
+
+
+async def link_user_wallet(pool, user_id, wallet_address):
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            has_primary = await conn.fetchval(
+                """
+                SELECT EXISTS(
+                    SELECT 1 FROM user_wallets
+                    WHERE user_id = $1 AND is_primary = TRUE
+                )
+                """,
+                user_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO user_wallets(user_id, wallet_address, verified_at, is_primary)
+                VALUES($1, $2, NOW(), $3)
+                ON CONFLICT (user_id, wallet_address) DO UPDATE
+                SET verified_at = NOW()
+                """,
+                user_id,
+                wallet_address,
+                not bool(has_primary),
+            )
+            return True
+    except Exception as exc:
+        print(f"DB link wallet failed: {exc}")
+        return False
+
+
+async def set_primary_wallet(pool, user_id, wallet_address):
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE user_wallets
+                SET is_primary = FALSE
+                WHERE user_id = $1
+                """,
+                user_id,
+            )
+            result = await conn.execute(
+                """
+                UPDATE user_wallets
+                SET is_primary = TRUE
+                WHERE user_id = $1 AND wallet_address = $2
+                """,
+                user_id,
+                wallet_address,
+            )
+            changed = int(str(result).split()[-1])
+            return changed > 0
+    except Exception as exc:
+        print(f"DB set primary wallet failed: {exc}")
+        return False
+
+
+async def remove_user_wallet(pool, user_id, wallet_address):
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            was_primary = await conn.fetchval(
+                """
+                SELECT is_primary
+                FROM user_wallets
+                WHERE user_id = $1 AND wallet_address = $2
+                """,
+                user_id,
+                wallet_address,
+            )
+            result = await conn.execute(
+                """
+                DELETE FROM user_wallets
+                WHERE user_id = $1 AND wallet_address = $2
+                """,
+                user_id,
+                wallet_address,
+            )
+            deleted = int(str(result).split()[-1])
+            if deleted <= 0:
+                return False
+            if was_primary:
+                await conn.execute(
+                    """
+                    UPDATE user_wallets
+                    SET is_primary = TRUE
+                    WHERE user_id = $1
+                      AND wallet_address = (
+                          SELECT wallet_address
+                          FROM user_wallets
+                          WHERE user_id = $1
+                          ORDER BY verified_at DESC
+                          LIMIT 1
+                      )
+                    """,
+                    user_id,
+                )
+            return True
+    except Exception as exc:
+        print(f"DB remove wallet failed: {exc}")
         return False
 
 

@@ -292,6 +292,27 @@ h1 {
   padding: 18px 22px;
 }
 
+.wallet-panel {
+  margin-top: 20px;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  padding: 14px 18px;
+}
+
+.wallet-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.wallet-row:last-child {
+  border-bottom: none;
+}
+
 .market-detail {
   margin-top: 24px;
   border-radius: 20px;
@@ -322,6 +343,101 @@ h1 {
 .market-history {
   border-top: 1px dashed var(--line);
   padding-top: 12px;
+}
+
+.trading-panel {
+  border-top: 1px dashed var(--line);
+  padding-top: 12px;
+  margin-bottom: 16px;
+}
+
+.trade-header-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.trade-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(140px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.trade-field {
+  display: grid;
+  gap: 6px;
+}
+
+.trade-field input,
+.trade-field select {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  padding: 10px 12px;
+  font-size: 14px;
+}
+
+.trade-summary {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.trade-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.trade-warning {
+  margin-top: 12px;
+  display: grid;
+  gap: 6px;
+  color: #ffd59a;
+  font-size: 13px;
+}
+
+.trade-books {
+  margin-top: 16px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.trade-book {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.trade-book h4 {
+  margin: 0;
+}
+
+.trade-book-row {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+
+.trade-book-row:last-child {
+  border-bottom: none;
+}
+
+.trade-notice {
+  margin-top: 10px;
+  color: var(--accent);
+  font-size: 13px;
 }
 
 .history-actions {
@@ -448,6 +564,12 @@ h1 {
   }
 
   .detail-metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .trade-grid,
+  .trade-books,
+  .trade-book-row {
     grid-template-columns: 1fr;
   }
 }

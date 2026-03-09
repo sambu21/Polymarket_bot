@@ -1,9 +1,12 @@
 import asyncio
 import json
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Set
 
+from eth_account import Account
+from eth_account.messages import encode_defunct
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -21,15 +24,21 @@ try:
         get_recent_large_trades,
         get_user_preferences,
         get_user_by_email,
+        get_user_wallets,
         init_db,
         insert_large_trade,
+        link_user_wallet,
         list_user_alerts,
         list_user_bookmarks,
         purge_old_large_trades,
+        remove_user_wallet,
         remove_user_alert,
         remove_user_bookmark,
+        set_primary_wallet,
         upsert_user_alert,
         upsert_user_preferences,
+        upsert_wallet_nonce,
+        consume_wallet_nonce,
     )
 except Exception:
     add_user_bookmark = None
@@ -39,15 +48,21 @@ except Exception:
     get_recent_large_trades = None
     get_user_preferences = None
     get_user_by_email = None
+    get_user_wallets = None
     init_db = None
     insert_large_trade = None
+    link_user_wallet = None
     list_user_alerts = None
     list_user_bookmarks = None
     purge_old_large_trades = None
+    remove_user_wallet = None
     remove_user_alert = None
     remove_user_bookmark = None
+    set_primary_wallet = None
     upsert_user_alert = None
     upsert_user_preferences = None
+    upsert_wallet_nonce = None
+    consume_wallet_nonce = None
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY", "change-this-secret")
@@ -55,6 +70,7 @@ AUTH_ALGORITHM = "HS256"
 AUTH_EXPIRE_HOURS = int(os.getenv("AUTH_EXPIRE_HOURS", "168"))
 LARGE_TRADE_RETENTION_HOURS = int(os.getenv("LARGE_TRADE_RETENTION_HOURS", "48"))
 LARGE_TRADE_CLEANUP_SECONDS = int(os.getenv("LARGE_TRADE_CLEANUP_SECONDS", "600"))
+WALLET_NONCE_TTL_SECONDS = int(os.getenv("WALLET_NONCE_TTL_SECONDS", "600"))
 
 app = FastAPI(title="Polymarket Monitor API")
 app.add_middleware(
@@ -90,6 +106,20 @@ class AlertPayload(BaseModel):
     market_id: str
     min_notional_usdc: float = 5000
     enabled: bool = True
+
+
+class WalletChallengePayload(BaseModel):
+    wallet_address: str
+
+
+class WalletVerifyPayload(BaseModel):
+    wallet_address: str
+    nonce: str
+    signature: str
+
+
+def _normalize_wallet_address(address: str) -> str:
+    return (address or "").strip().lower()
 
 
 def _normalize_email(email: str) -> str:
@@ -254,6 +284,16 @@ def _extract_market_category(market: dict) -> tuple[str | None, str | None]:
             return name or slug, slug
 
     return None, None
+
+
+def _wallet_link_message(email: str, wallet_address: str, nonce: str) -> str:
+    return (
+        "Polymarket Watch wallet linking\n\n"
+        f"Account: {email}\n"
+        f"Wallet: {wallet_address}\n"
+        f"Nonce: {nonce}\n\n"
+        "Sign this message to verify wallet ownership."
+    )
 
 
 @app.on_event("startup")
@@ -431,6 +471,95 @@ async def user_bookmarks_add(payload: BookmarkPayload, user: dict = Depends(requ
     if not ok:
         raise HTTPException(status_code=500, detail="Could not save bookmark")
     return {"ok": True}
+
+
+@app.get("/api/user/wallets")
+async def user_wallets(user: dict = Depends(require_user)) -> dict:
+    if db_pool is None or get_user_wallets is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    items = await get_user_wallets(db_pool, user["id"])
+    return {"wallets": items}
+
+
+@app.post("/api/user/wallets/challenge")
+async def user_wallets_challenge(payload: WalletChallengePayload, user: dict = Depends(require_user)) -> dict:
+    if db_pool is None or upsert_wallet_nonce is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    wallet_address = _normalize_wallet_address(payload.wallet_address)
+    if not wallet_address.startswith("0x") or len(wallet_address) != 42:
+        raise HTTPException(status_code=400, detail="Invalid wallet address")
+
+    nonce = secrets.token_urlsafe(16)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=WALLET_NONCE_TTL_SECONDS)
+    ok = await upsert_wallet_nonce(db_pool, user["id"], wallet_address, nonce, expires_at)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Could not create challenge")
+    message = _wallet_link_message(user["email"], wallet_address, nonce)
+    return {
+        "wallet_address": wallet_address,
+        "nonce": nonce,
+        "message": message,
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+@app.post("/api/user/wallets/verify")
+async def user_wallets_verify(payload: WalletVerifyPayload, user: dict = Depends(require_user)) -> dict:
+    if db_pool is None or consume_wallet_nonce is None or link_user_wallet is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    wallet_address = _normalize_wallet_address(payload.wallet_address)
+    nonce = (payload.nonce or "").strip()
+    signature = (payload.signature or "").strip()
+    if not wallet_address.startswith("0x") or len(wallet_address) != 42:
+        raise HTTPException(status_code=400, detail="Invalid wallet address")
+    if not nonce or not signature:
+        raise HTTPException(status_code=400, detail="Missing nonce or signature")
+
+    message = _wallet_link_message(user["email"], wallet_address, nonce)
+    try:
+        recovered = Account.recover_message(encode_defunct(text=message), signature=signature)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    if _normalize_wallet_address(recovered) != wallet_address:
+        raise HTTPException(status_code=400, detail="Signature does not match wallet")
+
+    valid_nonce = await consume_wallet_nonce(db_pool, user["id"], wallet_address, nonce)
+    if not valid_nonce:
+        raise HTTPException(status_code=400, detail="Nonce expired or invalid")
+
+    ok = await link_user_wallet(db_pool, user["id"], wallet_address)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Could not link wallet")
+
+    wallets = await get_user_wallets(db_pool, user["id"]) if get_user_wallets else []
+    return {
+        "ok": True,
+        "wallets": wallets,
+    }
+
+
+@app.put("/api/user/wallets/{wallet_address}/primary")
+async def user_wallets_primary(wallet_address: str, user: dict = Depends(require_user)) -> dict:
+    if db_pool is None or set_primary_wallet is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    ok = await set_primary_wallet(db_pool, user["id"], _normalize_wallet_address(wallet_address))
+    if not ok:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    wallets = await get_user_wallets(db_pool, user["id"]) if get_user_wallets else []
+    return {"ok": True, "wallets": wallets}
+
+
+@app.delete("/api/user/wallets/{wallet_address}")
+async def user_wallets_remove(wallet_address: str, user: dict = Depends(require_user)) -> dict:
+    if db_pool is None or remove_user_wallet is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    ok = await remove_user_wallet(db_pool, user["id"], _normalize_wallet_address(wallet_address))
+    if not ok:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    wallets = await get_user_wallets(db_pool, user["id"]) if get_user_wallets else []
+    return {"ok": True, "wallets": wallets}
 
 
 @app.delete("/api/user/bookmarks/{market_id}")

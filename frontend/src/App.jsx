@@ -1,6 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { clearAuthToken, getAuthToken } from "./auth";
+import {
+  createTradingClient,
+  parseMarketTokens,
+  TRADING_ASSET_TYPE,
+  TRADING_SIDE,
+} from "./polymarket";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 const POLL_MS = 20000;
@@ -10,6 +16,8 @@ const MARKET_HISTORY_PAGE_SIZE = 25;
 const STREAM_MAX_EVENTS = 100;
 const ALL_CATEGORIES = "__all__";
 const DEFAULT_MIN_LARGE_TRADE_USDC = 5000;
+const DEFAULT_ORDER_SIZE = "10";
+const DEFAULT_ORDER_PRICE = "0.50";
 
 function fmtNumber(value) {
   if (value === null || value === undefined) return "-";
@@ -103,6 +111,16 @@ function defaultHistoryState() {
   };
 }
 
+function toFloat(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function formatMaybeNumber(value, digits = 2) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(digits) : "-";
+}
+
 export default function App() {
   const navigate = useNavigate();
   const authToken = getAuthToken();
@@ -119,7 +137,34 @@ export default function App() {
   const [userProfile, setUserProfile] = useState(null);
   const [bookmarksByMarketId, setBookmarksByMarketId] = useState({});
   const [alertsByMarketId, setAlertsByMarketId] = useState({});
+  const [linkedWallets, setLinkedWallets] = useState([]);
+  const [walletLoading, setWalletLoading] = useState(false);
+  const [walletError, setWalletError] = useState("");
   const [prefsLoaded, setPrefsLoaded] = useState(false);
+  const [tradingClient, setTradingClient] = useState(null);
+  const [tradingWalletAddress, setTradingWalletAddress] = useState("");
+  const [tradingStatus, setTradingStatus] = useState("inactive");
+  const [tradingNotice, setTradingNotice] = useState("");
+  const [tradingError, setTradingError] = useState("");
+  const [tradingLoading, setTradingLoading] = useState(false);
+  const [approvalLoading, setApprovalLoading] = useState("");
+  const [orderSubmitting, setOrderSubmitting] = useState(false);
+  const [cancelingOrderId, setCancelingOrderId] = useState("");
+  const [marketMeta, setMarketMeta] = useState({ tickSize: "", negRisk: false, lastTradePrice: "" });
+  const [balanceState, setBalanceState] = useState({
+    collateralBalance: "",
+    collateralAllowance: "",
+    conditionalBalance: "",
+    conditionalAllowance: "",
+  });
+  const [openOrders, setOpenOrders] = useState([]);
+  const [userFills, setUserFills] = useState([]);
+  const [orderForm, setOrderForm] = useState({
+    side: TRADING_SIDE.BUY,
+    outcome: "",
+    price: DEFAULT_ORDER_PRICE,
+    size: DEFAULT_ORDER_SIZE,
+  });
 
   useEffect(() => {
     let isMounted = true;
@@ -174,17 +219,19 @@ export default function App() {
         setUserProfile(null);
         setBookmarksByMarketId({});
         setAlertsByMarketId({});
+        setLinkedWallets([]);
         setPrefsLoaded(false);
         return;
       }
 
       const headers = { Authorization: `Bearer ${authToken}` };
       try {
-        const [meRes, prefsRes, bookmarksRes, alertsRes] = await Promise.all([
+        const [meRes, prefsRes, bookmarksRes, alertsRes, walletsRes] = await Promise.all([
           fetch(`${API_BASE}/api/auth/me`, { headers }),
           fetch(`${API_BASE}/api/user/preferences`, { headers }),
           fetch(`${API_BASE}/api/user/bookmarks`, { headers }),
           fetch(`${API_BASE}/api/user/alerts`, { headers }),
+          fetch(`${API_BASE}/api/user/wallets`, { headers }),
         ]);
         if (cancelled) return;
 
@@ -216,6 +263,10 @@ export default function App() {
           });
           setAlertsByMarketId(map);
         }
+        if (walletsRes.ok) {
+          const data = await walletsRes.json();
+          setLinkedWallets(Array.isArray(data.wallets) ? data.wallets : []);
+        }
       } catch {
         // ignore
       } finally {
@@ -238,6 +289,126 @@ export default function App() {
       setSelectedMarketId(null);
     }
   }, [markets, selectedMarketId]);
+
+  useEffect(() => {
+    if (!authToken) {
+      setTradingClient(null);
+      setTradingWalletAddress("");
+      setTradingStatus("inactive");
+      setTradingNotice("");
+      setTradingError("");
+      setOpenOrders([]);
+      setUserFills([]);
+      setBalanceState({
+        collateralBalance: "",
+        collateralAllowance: "",
+        conditionalBalance: "",
+        conditionalAllowance: "",
+      });
+    }
+  }, [authToken]);
+
+  const qualifiedLargeTrades = useMemo(() => {
+    return largeTrades.filter((trade) => tradeNotional(trade) >= minLargeTradeUsdc);
+  }, [largeTrades, minLargeTradeUsdc]);
+
+  const latestQualifiedTradeByMarket = useMemo(() => {
+    const byMarket = new Map();
+    qualifiedLargeTrades.forEach((trade) => {
+      const id = String(trade.market_id || "");
+      if (!id || byMarket.has(id)) return;
+      byMarket.set(id, trade);
+    });
+    return byMarket;
+  }, [qualifiedLargeTrades]);
+
+  const enrichedMarkets = useMemo(() => {
+    return markets.map((m) => {
+      const prices = parseOutcomePrices(m.outcomes, m.outcomePrices);
+      const id = marketKey(m);
+      const lastLarge = latestQualifiedTradeByMarket.get(id);
+      const category = normalizeCategory(m.category);
+      const categoryKey = toCategoryKey(m.categorySlug || category);
+      return {
+        ...m,
+        _key: id,
+        category,
+        categoryKey,
+        prices,
+        lastLarge,
+      };
+    });
+  }, [markets, latestQualifiedTradeByMarket]);
+
+  const selectedMarket = useMemo(() => {
+    if (!selectedMarketId) return null;
+    return enrichedMarkets.find((m) => m._key === selectedMarketId) || null;
+  }, [enrichedMarkets, selectedMarketId]);
+  const primaryWallet = useMemo(() => {
+    return linkedWallets.find((wallet) => wallet.is_primary) || linkedWallets[0] || null;
+  }, [linkedWallets]);
+  const selectedMarketTokens = useMemo(() => {
+    return selectedMarket ? parseMarketTokens(selectedMarket) : [];
+  }, [selectedMarket]);
+  const selectedTradingToken = useMemo(() => {
+    if (!selectedMarketTokens.length) return null;
+    return (
+      selectedMarketTokens.find(
+        (token) => token.outcome.toLowerCase() === String(orderForm.outcome || "").toLowerCase()
+      ) || selectedMarketTokens[0]
+    );
+  }, [orderForm.outcome, selectedMarketTokens]);
+  const requiredUsdc = useMemo(() => {
+    const price = Math.max(0, toFloat(orderForm.price));
+    const size = Math.max(0, toFloat(orderForm.size));
+    return price * size;
+  }, [orderForm.price, orderForm.size]);
+  const collateralBalance = toFloat(balanceState.collateralBalance);
+  const collateralAllowance = toFloat(balanceState.collateralAllowance);
+  const conditionalBalance = toFloat(balanceState.conditionalBalance);
+  const conditionalAllowance = toFloat(balanceState.conditionalAllowance);
+  const needsCollateralApproval = orderForm.side === TRADING_SIDE.BUY && requiredUsdc > collateralAllowance;
+  const needsConditionalApproval = orderForm.side === TRADING_SIDE.SELL && toFloat(orderForm.size) > conditionalAllowance;
+  const insufficientCollateral = orderForm.side === TRADING_SIDE.BUY && requiredUsdc > collateralBalance;
+  const insufficientShares = orderForm.side === TRADING_SIDE.SELL && toFloat(orderForm.size) > conditionalBalance;
+  const canSubmitOrder = Boolean(
+    tradingClient &&
+      selectedMarket &&
+      selectedTradingToken &&
+      toFloat(orderForm.price) > 0 &&
+      toFloat(orderForm.price) < 1 &&
+      toFloat(orderForm.size) > 0 &&
+      !needsCollateralApproval &&
+      !needsConditionalApproval &&
+      !insufficientCollateral &&
+      !insufficientShares
+  );
+
+  useEffect(() => {
+    if (!selectedMarketTokens.length) {
+      setOrderForm((prev) => ({
+        ...prev,
+        outcome: "",
+      }));
+      return;
+    }
+    setOrderForm((prev) => {
+      const nextOutcome = selectedMarketTokens.some(
+        (token) => token.outcome.toLowerCase() === String(prev.outcome || "").toLowerCase()
+      )
+        ? prev.outcome
+        : selectedMarketTokens[0].outcome;
+      const activeToken = selectedMarketTokens.find(
+        (token) => token.outcome.toLowerCase() === String(nextOutcome || "").toLowerCase()
+      );
+      const defaultPrice = activeToken?.price ?? 0.5;
+      return {
+        ...prev,
+        outcome: nextOutcome,
+        price: prev.outcome === nextOutcome && prev.price ? prev.price : defaultPrice.toFixed(2),
+      };
+    });
+  }, [selectedMarketTokens]);
 
   useEffect(() => {
     let ws;
@@ -297,38 +468,6 @@ export default function App() {
       if (ws) ws.close();
     };
   }, [authToken]);
-
-  const qualifiedLargeTrades = useMemo(() => {
-    return largeTrades.filter((trade) => tradeNotional(trade) >= minLargeTradeUsdc);
-  }, [largeTrades, minLargeTradeUsdc]);
-
-  const latestQualifiedTradeByMarket = useMemo(() => {
-    const byMarket = new Map();
-    qualifiedLargeTrades.forEach((trade) => {
-      const id = String(trade.market_id || "");
-      if (!id || byMarket.has(id)) return;
-      byMarket.set(id, trade);
-    });
-    return byMarket;
-  }, [qualifiedLargeTrades]);
-
-  const enrichedMarkets = useMemo(() => {
-    return markets.map((m) => {
-      const prices = parseOutcomePrices(m.outcomes, m.outcomePrices);
-      const id = marketKey(m);
-      const lastLarge = latestQualifiedTradeByMarket.get(id);
-      const category = normalizeCategory(m.category);
-      const categoryKey = toCategoryKey(m.categorySlug || category);
-      return {
-        ...m,
-        _key: id,
-        category,
-        categoryKey,
-        prices,
-        lastLarge,
-      };
-    });
-  }, [markets, latestQualifiedTradeByMarket]);
 
   const categoryOptions = useMemo(() => {
     const counts = new Map();
@@ -395,11 +534,6 @@ export default function App() {
   const visibleMarkets = useMemo(() => {
     return filteredMarkets.slice(0, visibleCount);
   }, [filteredMarkets, visibleCount]);
-
-  const selectedMarket = useMemo(() => {
-    if (!selectedMarketId) return null;
-    return enrichedMarkets.find((m) => m._key === selectedMarketId) || null;
-  }, [enrichedMarkets, selectedMarketId]);
 
   const selectedHistory = selectedMarketId
     ? marketHistoryById[selectedMarketId] || defaultHistoryState()
@@ -580,6 +714,242 @@ export default function App() {
     });
   }
 
+  async function connectAndLinkWallet() {
+    if (!authToken) {
+      navigate("/login");
+      return;
+    }
+    if (!window?.ethereum) {
+      setWalletError("No wallet provider found. Install MetaMask.");
+      return;
+    }
+    setWalletError("");
+    setWalletLoading(true);
+    try {
+      const headers = {
+        Authorization: `Bearer ${authToken}`,
+        "Content-Type": "application/json",
+      };
+      const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+      const walletAddress = String((accounts || [])[0] || "").toLowerCase();
+      if (!walletAddress) throw new Error("No wallet account selected");
+
+      const challengeRes = await fetch(`${API_BASE}/api/user/wallets/challenge`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ wallet_address: walletAddress }),
+      });
+      const challenge = await challengeRes.json();
+      if (!challengeRes.ok) throw new Error(challenge?.detail || "Could not create challenge");
+
+      const signature = await window.ethereum.request({
+        method: "personal_sign",
+        params: [challenge.message, walletAddress],
+      });
+
+      const verifyRes = await fetch(`${API_BASE}/api/user/wallets/verify`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          wallet_address: walletAddress,
+          nonce: challenge.nonce,
+          signature,
+        }),
+      });
+      const verifyData = await verifyRes.json();
+      if (!verifyRes.ok) throw new Error(verifyData?.detail || "Wallet verification failed");
+      setLinkedWallets(Array.isArray(verifyData.wallets) ? verifyData.wallets : []);
+    } catch (err) {
+      setWalletError(err.message || "Wallet linking failed");
+    } finally {
+      setWalletLoading(false);
+    }
+  }
+
+  async function setPrimaryWallet(walletAddress) {
+    const headers = { Authorization: `Bearer ${authToken}` };
+    const res = await fetch(`${API_BASE}/api/user/wallets/${encodeURIComponent(walletAddress)}/primary`, {
+      method: "PUT",
+      headers,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setWalletError(data?.detail || "Could not set primary wallet");
+      return;
+    }
+    setWalletError("");
+    setLinkedWallets(Array.isArray(data.wallets) ? data.wallets : []);
+  }
+
+  async function unlinkWallet(walletAddress) {
+    const headers = { Authorization: `Bearer ${authToken}` };
+    const res = await fetch(`${API_BASE}/api/user/wallets/${encodeURIComponent(walletAddress)}`, {
+      method: "DELETE",
+      headers,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setWalletError(data?.detail || "Could not remove wallet");
+      return;
+    }
+    setWalletError("");
+    setLinkedWallets(Array.isArray(data.wallets) ? data.wallets : []);
+  }
+
+  const ensureTradingClient = useCallback(async () => {
+    if (!authToken) {
+      navigate("/login");
+      throw new Error("Login required to trade");
+    }
+    if (!linkedWallets.length) {
+      throw new Error("Link a wallet to your account before trading");
+    }
+    setTradingError("");
+    setTradingNotice("");
+    setTradingStatus("connecting");
+    const { client, address } = await createTradingClient();
+    const linked = linkedWallets.find(
+      (wallet) => String(wallet.wallet_address || "").toLowerCase() === address
+    );
+    if (!linked) {
+      throw new Error("Connected wallet is not linked to this account");
+    }
+    setTradingClient(client);
+    setTradingWalletAddress(address);
+    setTradingStatus("ready");
+    setTradingNotice(`Trading wallet ready: ${address.slice(0, 6)}...${address.slice(-4)}`);
+    return { client, address, linkedWallet: linked };
+  }, [authToken, linkedWallets, navigate]);
+
+  const loadTradingData = useCallback(async () => {
+    if (!tradingClient || !selectedMarket || !selectedTradingToken) return;
+    setTradingLoading(true);
+    setTradingError("");
+    try {
+      const [orderBook, collateral, conditional, orders, trades] = await Promise.all([
+        tradingClient.getOrderBook(selectedTradingToken.tokenId),
+        tradingClient.getBalanceAllowance({ asset_type: TRADING_ASSET_TYPE.COLLATERAL }),
+        tradingClient.getBalanceAllowance({
+          asset_type: TRADING_ASSET_TYPE.CONDITIONAL,
+          token_id: selectedTradingToken.tokenId,
+        }),
+        tradingClient.getOpenOrders({ market: selectedMarket._key }),
+        tradingClient.getTrades({ market: selectedMarket._key }, true),
+      ]);
+      setMarketMeta({
+        tickSize: orderBook?.tick_size || "",
+        negRisk: Boolean(orderBook?.neg_risk),
+        lastTradePrice: orderBook?.last_trade_price || "",
+      });
+      setBalanceState({
+        collateralBalance: collateral?.balance || "",
+        collateralAllowance: collateral?.allowance || "",
+        conditionalBalance: conditional?.balance || "",
+        conditionalAllowance: conditional?.allowance || "",
+      });
+      setOpenOrders(Array.isArray(orders) ? orders : []);
+      setUserFills(Array.isArray(trades) ? trades.slice(0, 12) : []);
+    } catch (err) {
+      setTradingError(err.message || "Could not load trading data");
+    } finally {
+      setTradingLoading(false);
+    }
+  }, [selectedMarket, selectedTradingToken, tradingClient]);
+
+  async function activateTrading() {
+    try {
+      await ensureTradingClient();
+    } catch (err) {
+      setTradingStatus("error");
+      setTradingError(err.message || "Could not activate trading");
+    }
+  }
+
+  async function updateAllowance(assetType) {
+    try {
+      const session = tradingClient ? { client: tradingClient } : await ensureTradingClient();
+      if (!selectedTradingToken) {
+        throw new Error("Select an outcome token first");
+      }
+      setApprovalLoading(assetType);
+      setTradingError("");
+      setTradingNotice("");
+      const params = assetType === TRADING_ASSET_TYPE.CONDITIONAL
+        ? { asset_type: assetType, token_id: selectedTradingToken.tokenId }
+        : { asset_type: assetType };
+      await session.client.updateBalanceAllowance(params);
+      setTradingNotice(
+        assetType === TRADING_ASSET_TYPE.COLLATERAL
+          ? "USDC approval updated"
+          : `Approval updated for ${selectedTradingToken.outcome}`
+      );
+      await loadTradingData();
+    } catch (err) {
+      setTradingError(err.message || "Could not update allowance");
+    } finally {
+      setApprovalLoading("");
+    }
+  }
+
+  async function submitOrder() {
+    try {
+      const session = tradingClient ? { client: tradingClient } : await ensureTradingClient();
+      if (!selectedTradingToken) {
+        throw new Error("This market has no tradable token mapping");
+      }
+      const price = Number(orderForm.price);
+      const size = Number(orderForm.size);
+      if (!Number.isFinite(price) || price <= 0 || price >= 1) {
+        throw new Error("Price must be between 0 and 1");
+      }
+      if (!Number.isFinite(size) || size <= 0) {
+        throw new Error("Size must be greater than 0");
+      }
+      const tickSize = marketMeta.tickSize || (await session.client.getTickSize(selectedTradingToken.tokenId));
+      const negRisk = typeof marketMeta.negRisk === "boolean"
+        ? marketMeta.negRisk
+        : await session.client.getNegRisk(selectedTradingToken.tokenId);
+      setOrderSubmitting(true);
+      setTradingError("");
+      setTradingNotice("");
+      await session.client.createAndPostOrder(
+        {
+          tokenID: selectedTradingToken.tokenId,
+          price,
+          size,
+          side: orderForm.side,
+        },
+        {
+          tickSize,
+          negRisk,
+        },
+        "GTC"
+      );
+      setTradingNotice(`Order submitted: ${orderForm.side} ${size} ${selectedTradingToken.outcome} @ ${price}`);
+      await loadTradingData();
+    } catch (err) {
+      setTradingError(err.message || "Order submission failed");
+    } finally {
+      setOrderSubmitting(false);
+    }
+  }
+
+  async function cancelOpenOrder(orderId) {
+    try {
+      const session = tradingClient ? { client: tradingClient } : await ensureTradingClient();
+      setCancelingOrderId(orderId);
+      setTradingError("");
+      setTradingNotice("");
+      await session.client.cancelOrder({ orderID: orderId });
+      setTradingNotice(`Canceled order ${orderId.slice(0, 10)}...`);
+      await loadTradingData();
+    } catch (err) {
+      setTradingError(err.message || "Could not cancel order");
+    } finally {
+      setCancelingOrderId("");
+    }
+  }
+
   const canLoadMoreMarkets = visibleMarkets.length < filteredMarkets.length;
 
   useEffect(() => {
@@ -601,6 +971,23 @@ export default function App() {
     }, 500);
     return () => clearTimeout(timer);
   }, [authToken, minLargeTradeUsdc, prefsLoaded, selectedCategory]);
+
+  useEffect(() => {
+    if (!tradingClient || !selectedMarket || !selectedTradingToken) return;
+    loadTradingData();
+  }, [loadTradingData, selectedMarket, selectedTradingToken, tradingClient]);
+
+  useEffect(() => {
+    if (!tradingWalletAddress) return;
+    const stillLinked = linkedWallets.some(
+      (wallet) => String(wallet.wallet_address || "").toLowerCase() === tradingWalletAddress
+    );
+    if (stillLinked) return;
+    setTradingClient(null);
+    setTradingWalletAddress("");
+    setTradingStatus("inactive");
+    setTradingNotice("");
+  }, [linkedWallets, tradingWalletAddress]);
 
   return (
     <div className="app">
@@ -693,6 +1080,44 @@ export default function App() {
           </button>
         ))}
       </section>
+      {authToken && (
+        <section className="wallet-panel">
+          <div className="stream-header">
+            <h3>Linked Wallets</h3>
+            <button className="btn" type="button" onClick={connectAndLinkWallet} disabled={walletLoading}>
+              {walletLoading ? "Connecting..." : "Connect Wallet"}
+            </button>
+          </div>
+          {walletError && <div className="history-error">{walletError}</div>}
+          <div className="stream-list">
+            {linkedWallets.length === 0 && (
+              <div className="stream-empty">No linked wallets yet.</div>
+            )}
+            {linkedWallets.map((wallet) => (
+              <div className="wallet-row" key={wallet.wallet_address}>
+                <span className="mono truncate">{wallet.wallet_address}</span>
+                <span className="pill">{wallet.is_primary ? "Primary" : "Secondary"}</span>
+                {!wallet.is_primary && (
+                  <button
+                    className="btn"
+                    type="button"
+                    onClick={() => setPrimaryWallet(wallet.wallet_address)}
+                  >
+                    Set Primary
+                  </button>
+                )}
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={() => unlinkWallet(wallet.wallet_address)}
+                >
+                  Unlink
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       {selectedMarket && (
         <section className="market-detail">
@@ -738,6 +1163,205 @@ export default function App() {
               <span className="label">Category</span>
               <span className="value">{selectedMarket.category || "-"}</span>
             </div>
+          </div>
+
+          <div className="trading-panel">
+            <div className="stream-header">
+              <h3>Trading</h3>
+              <div className="trade-header-actions">
+                <span className="pill">{tradingStatus}</span>
+                <button className="btn" type="button" onClick={activateTrading}>
+                  {tradingClient ? "Reconnect Wallet" : "Enable Trading"}
+                </button>
+                {tradingClient && (
+                  <button className="btn" type="button" onClick={loadTradingData} disabled={tradingLoading}>
+                    {tradingLoading ? "Refreshing..." : "Refresh"}
+                  </button>
+                )}
+              </div>
+            </div>
+            {!authToken && (
+              <div className="stream-empty">Login and link a wallet to place bets from this app.</div>
+            )}
+            {authToken && !linkedWallets.length && (
+              <div className="stream-empty">Link a wallet above before you can place orders.</div>
+            )}
+            {authToken && linkedWallets.length > 0 && (
+              <>
+                <div className="active-filter">
+                  Linked primary wallet: {primaryWallet?.wallet_address || "-"}
+                </div>
+                {tradingWalletAddress && (
+                  <div className="active-filter">
+                    Active trading wallet: {tradingWalletAddress}
+                  </div>
+                )}
+                {tradingNotice && <div className="trade-notice">{tradingNotice}</div>}
+                {tradingError && <div className="history-error">{tradingError}</div>}
+                <div className="trade-grid">
+                  <label className="trade-field">
+                    <span className="label">Outcome</span>
+                    <select
+                      value={selectedTradingToken?.outcome || ""}
+                      onChange={(e) => setOrderForm((prev) => ({ ...prev, outcome: e.target.value }))}
+                      disabled={!selectedMarketTokens.length}
+                    >
+                      {selectedMarketTokens.map((token) => (
+                        <option key={token.tokenId} value={token.outcome}>
+                          {token.outcome}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="trade-field">
+                    <span className="label">Side</span>
+                    <select
+                      value={orderForm.side}
+                      onChange={(e) => setOrderForm((prev) => ({ ...prev, side: e.target.value }))}
+                    >
+                      <option value={TRADING_SIDE.BUY}>BUY</option>
+                      <option value={TRADING_SIDE.SELL}>SELL</option>
+                    </select>
+                  </label>
+                  <label className="trade-field">
+                    <span className="label">Price</span>
+                    <input
+                      type="number"
+                      min="0.001"
+                      max="0.999"
+                      step={marketMeta.tickSize || "0.001"}
+                      value={orderForm.price}
+                      onChange={(e) => setOrderForm((prev) => ({ ...prev, price: e.target.value }))}
+                    />
+                  </label>
+                  <label className="trade-field">
+                    <span className="label">Size</span>
+                    <input
+                      type="number"
+                      min="1"
+                      step="1"
+                      value={orderForm.size}
+                      onChange={(e) => setOrderForm((prev) => ({ ...prev, size: e.target.value }))}
+                    />
+                  </label>
+                </div>
+                <div className="trade-summary">
+                  <div>
+                    <span className="label">Token ID</span>
+                    <span className="value mono">{selectedTradingToken?.tokenId || "-"}</span>
+                  </div>
+                  <div>
+                    <span className="label">Notional</span>
+                    <span className="value">{formatMaybeNumber(requiredUsdc, 2)} USDC</span>
+                  </div>
+                  <div>
+                    <span className="label">Tick Size</span>
+                    <span className="value">{marketMeta.tickSize || "-"}</span>
+                  </div>
+                  <div>
+                    <span className="label">Neg Risk</span>
+                    <span className="value">{marketMeta.tickSize ? String(Boolean(marketMeta.negRisk)) : "-"}</span>
+                  </div>
+                  <div>
+                    <span className="label">Last Trade</span>
+                    <span className="value">{formatMaybeNumber(marketMeta.lastTradePrice, 3)}</span>
+                  </div>
+                </div>
+                <div className="trade-summary">
+                  <div>
+                    <span className="label">USDC Balance / Allowance</span>
+                    <span className="value">
+                      {formatMaybeNumber(balanceState.collateralBalance, 2)} / {formatMaybeNumber(balanceState.collateralAllowance, 2)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="label">{selectedTradingToken?.outcome || "Outcome"} Balance / Allowance</span>
+                    <span className="value">
+                      {formatMaybeNumber(balanceState.conditionalBalance, 2)} / {formatMaybeNumber(balanceState.conditionalAllowance, 2)}
+                    </span>
+                  </div>
+                </div>
+                <div className="trade-actions">
+                  {needsCollateralApproval && (
+                    <button
+                      className="btn"
+                      type="button"
+                      onClick={() => updateAllowance(TRADING_ASSET_TYPE.COLLATERAL)}
+                      disabled={approvalLoading === TRADING_ASSET_TYPE.COLLATERAL}
+                    >
+                      {approvalLoading === TRADING_ASSET_TYPE.COLLATERAL ? "Approving..." : "Approve USDC"}
+                    </button>
+                  )}
+                  {needsConditionalApproval && (
+                    <button
+                      className="btn"
+                      type="button"
+                      onClick={() => updateAllowance(TRADING_ASSET_TYPE.CONDITIONAL)}
+                      disabled={approvalLoading === TRADING_ASSET_TYPE.CONDITIONAL}
+                    >
+                      {approvalLoading === TRADING_ASSET_TYPE.CONDITIONAL ? "Approving..." : `Approve ${selectedTradingToken?.outcome || "Outcome"}`}
+                    </button>
+                  )}
+                  <button
+                    className="btn"
+                    type="button"
+                    onClick={submitOrder}
+                    disabled={!canSubmitOrder || orderSubmitting}
+                  >
+                    {orderSubmitting ? "Submitting..." : `${orderForm.side} ${selectedTradingToken?.outcome || "Order"}`}
+                  </button>
+                </div>
+                {(insufficientCollateral || insufficientShares || needsCollateralApproval || needsConditionalApproval) && (
+                  <div className="trade-warning">
+                    {insufficientCollateral && <div>USDC balance is below the required notional.</div>}
+                    {insufficientShares && <div>Outcome token balance is below the order size.</div>}
+                    {needsCollateralApproval && <div>USDC allowance must cover the order notional.</div>}
+                    {needsConditionalApproval && <div>Outcome token allowance must cover the sell size.</div>}
+                  </div>
+                )}
+                <div className="trade-books">
+                  <div className="trade-book">
+                    <div className="stream-header">
+                      <h4>Open Orders</h4>
+                      <span>{openOrders.length}</span>
+                    </div>
+                    <div className="stream-list">
+                      {openOrders.length === 0 && <div className="stream-empty">No open orders for this market.</div>}
+                      {openOrders.map((order) => (
+                        <div className="trade-book-row" key={order.id}>
+                          <span className="mono">{order.outcome || "?"} {order.side}</span>
+                          <span className="mono">{formatMaybeNumber(order.original_size, 2)} @ {formatMaybeNumber(order.price, 3)}</span>
+                          <button
+                            className="btn"
+                            type="button"
+                            onClick={() => cancelOpenOrder(order.id)}
+                            disabled={cancelingOrderId === order.id}
+                          >
+                            {cancelingOrderId === order.id ? "Canceling..." : "Cancel"}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="trade-book">
+                    <div className="stream-header">
+                      <h4>Recent Fills</h4>
+                      <span>{userFills.length}</span>
+                    </div>
+                    <div className="stream-list">
+                      {userFills.length === 0 && <div className="stream-empty">No recent fills for this market.</div>}
+                      {userFills.map((trade) => (
+                        <div className="trade-book-row" key={trade.id}>
+                          <span className="mono">{trade.outcome || "?"} {trade.side}</span>
+                          <span className="mono">{formatMaybeNumber(trade.size, 2)} @ {formatMaybeNumber(trade.price, 3)}</span>
+                          <span className="mono">{new Date(trade.match_time).toLocaleString()}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
           </div>
 
           <div className="market-history">
