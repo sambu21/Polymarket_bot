@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { clearAuthToken, getAuthToken } from "./auth";
+import { buildAnalyticsSnapshot } from "./analytics";
 import {
   createTradingClient,
   parseMarketTokens,
@@ -16,6 +17,8 @@ const MARKET_HISTORY_PAGE_SIZE = 25;
 const STREAM_MAX_EVENTS = 100;
 const ALL_CATEGORIES = "__all__";
 const DEFAULT_MIN_LARGE_TRADE_USDC = 5000;
+const DEFAULT_OUTCOME_MIN = "0.05";
+const DEFAULT_OUTCOME_MAX = "0.95";
 const DEFAULT_ORDER_SIZE = "10";
 const DEFAULT_ORDER_PRICE = "0.50";
 
@@ -121,6 +124,28 @@ function formatMaybeNumber(value, digits = 2) {
   return Number.isFinite(numeric) ? numeric.toFixed(digits) : "-";
 }
 
+function withinRange(value, minValue, maxValue) {
+  if (value === null || value === undefined) return false;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return false;
+  const min = minValue === "" ? null : Number(minValue);
+  const max = maxValue === "" ? null : Number(maxValue);
+  if (min !== null && Number.isFinite(min) && numeric < min) return false;
+  if (max !== null && Number.isFinite(max) && numeric > max) return false;
+  return true;
+}
+
+function tradeMatchesOutcomePriceFilters(trade, yesMin, yesMax, noMin, noMax) {
+  const outcome = String(trade?.outcome || "").trim().toUpperCase();
+  if (outcome === "YES") {
+    return withinRange(trade?.price, yesMin, yesMax);
+  }
+  if (outcome === "NO") {
+    return withinRange(trade?.price, noMin, noMax);
+  }
+  return true;
+}
+
 export default function App() {
   const navigate = useNavigate();
   const authToken = getAuthToken();
@@ -131,6 +156,10 @@ export default function App() {
   const [wsStatus, setWsStatus] = useState("connecting");
   const [largeTrades, setLargeTrades] = useState([]);
   const [minLargeTradeUsdc, setMinLargeTradeUsdc] = useState(DEFAULT_MIN_LARGE_TRADE_USDC);
+  const [yesMinFilter, setYesMinFilter] = useState(DEFAULT_OUTCOME_MIN);
+  const [yesMaxFilter, setYesMaxFilter] = useState(DEFAULT_OUTCOME_MAX);
+  const [noMinFilter, setNoMinFilter] = useState(DEFAULT_OUTCOME_MIN);
+  const [noMaxFilter, setNoMaxFilter] = useState(DEFAULT_OUTCOME_MAX);
   const [visibleCount, setVisibleCount] = useState(MARKET_PAGE_SIZE);
   const [selectedMarketId, setSelectedMarketId] = useState(null);
   const [marketHistoryById, setMarketHistoryById] = useState({});
@@ -141,6 +170,7 @@ export default function App() {
   const [walletLoading, setWalletLoading] = useState(false);
   const [walletError, setWalletError] = useState("");
   const [prefsLoaded, setPrefsLoaded] = useState(false);
+  const [serverAnalytics, setServerAnalytics] = useState(null);
   const [tradingClient, setTradingClient] = useState(null);
   const [tradingWalletAddress, setTradingWalletAddress] = useState("");
   const [tradingStatus, setTradingStatus] = useState("inactive");
@@ -209,7 +239,7 @@ export default function App() {
 
   useEffect(() => {
     setVisibleCount(MARKET_PAGE_SIZE);
-  }, [searchQuery, selectedCategory]);
+  }, [searchQuery, selectedCategory, yesMinFilter, yesMaxFilter, noMinFilter, noMaxFilter]);
 
   useEffect(() => {
     let cancelled = false;
@@ -507,12 +537,19 @@ export default function App() {
   }, [enrichedMarkets]);
 
   const filteredLargeTrades = useMemo(() => {
-    if (selectedCategory === ALL_CATEGORIES) return qualifiedLargeTrades;
     return qualifiedLargeTrades.filter((trade) => {
-      const tradeCategory = marketCategoryById.get(String(trade.market_id || ""));
-      return tradeCategory === selectedCategory;
+      if (selectedCategory !== ALL_CATEGORIES) {
+        const tradeCategory = marketCategoryById.get(String(trade.market_id || ""));
+        if (tradeCategory !== selectedCategory) {
+          return false;
+        }
+      }
+      return tradeMatchesOutcomePriceFilters(trade, yesMinFilter, yesMaxFilter, noMinFilter, noMaxFilter);
     });
-  }, [qualifiedLargeTrades, marketCategoryById, selectedCategory]);
+  }, [marketCategoryById, noMaxFilter, noMinFilter, qualifiedLargeTrades, selectedCategory, yesMaxFilter, yesMinFilter]);
+  const analytics = useMemo(() => {
+    return serverAnalytics || buildAnalyticsSnapshot(marketsByCategory, filteredLargeTrades, ALERT_RECENT_MIN);
+  }, [filteredLargeTrades, marketsByCategory, serverAnalytics]);
 
   const alertMatches = useMemo(() => {
     if (!authToken) return [];
@@ -525,10 +562,12 @@ export default function App() {
 
   const filteredMarkets = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    if (!q) return marketsByCategory;
-    return marketsByCategory.filter((market) =>
-      String(market.question || "").toLowerCase().includes(q)
-    );
+    return marketsByCategory.filter((market) => {
+      if (q && !String(market.question || "").toLowerCase().includes(q)) {
+        return false;
+      }
+      return true;
+    });
   }, [marketsByCategory, searchQuery]);
 
   const visibleMarkets = useMemo(() => {
@@ -539,8 +578,13 @@ export default function App() {
     ? marketHistoryById[selectedMarketId] || defaultHistoryState()
     : defaultHistoryState();
   const selectedHistoryVisibleItems = useMemo(() => {
-    return selectedHistory.items.filter((trade) => tradeNotional(trade) >= minLargeTradeUsdc);
-  }, [selectedHistory, minLargeTradeUsdc]);
+    return selectedHistory.items.filter((trade) => {
+      if (tradeNotional(trade) < minLargeTradeUsdc) {
+        return false;
+      }
+      return tradeMatchesOutcomePriceFilters(trade, yesMinFilter, yesMaxFilter, noMinFilter, noMaxFilter);
+    });
+  }, [minLargeTradeUsdc, noMaxFilter, noMinFilter, selectedHistory, yesMaxFilter, yesMinFilter]);
 
   const loadMarketHistory = useCallback(async (marketId, append = false) => {
     if (!marketId) return;
@@ -973,6 +1017,35 @@ export default function App() {
   }, [authToken, minLargeTradeUsdc, prefsLoaded, selectedCategory]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    async function fetchAnalytics() {
+      try {
+        const params = new URLSearchParams({
+          category: selectedCategory,
+          min_notional: String(minLargeTradeUsdc),
+        });
+        const headers = authToken ? { Authorization: `Bearer ${authToken}` } : {};
+        const res = await fetch(`${API_BASE}/api/analytics/overview?${params.toString()}`, { headers });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!cancelled) {
+          setServerAnalytics(data.analytics || null);
+        }
+      } catch {
+        if (!cancelled) {
+          setServerAnalytics(null);
+        }
+      }
+    }
+
+    fetchAnalytics();
+    return () => {
+      cancelled = true;
+    };
+  }, [authToken, minLargeTradeUsdc, selectedCategory]);
+
+  useEffect(() => {
     if (!tradingClient || !selectedMarket || !selectedTradingToken) return;
     loadTradingData();
   }, [loadTradingData, selectedMarket, selectedTradingToken, tradingClient]);
@@ -1046,17 +1119,71 @@ export default function App() {
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
         />
-        <label className="min-usdc-control">
-          <span>Min large trade (USDC)</span>
-          <input
-            className="min-usdc-input"
-            type="number"
-            min="0"
-            step="100"
-            value={minLargeTradeUsdc}
-            onChange={(e) => setMinLargeTradeUsdc(Math.max(0, Number(e.target.value || 0)))}
-          />
-        </label>
+        <details className="advanced-search">
+          <summary>Advanced Search</summary>
+          <div className="advanced-search-note">
+            These filters narrow the large-trade feed
+          </div>
+          <div className="advanced-search-grid">
+            <label className="min-usdc-control">
+              <span>Min large trade (USDC)</span>
+              <input
+                className="min-usdc-input"
+                type="number"
+                min="0"
+                step="100"
+                value={minLargeTradeUsdc}
+                onChange={(e) => setMinLargeTradeUsdc(Math.max(0, Number(e.target.value || 0)))}
+              />
+            </label>
+            <label className="price-range-control">
+              <span>YES</span>
+              <input
+                className="price-range-input"
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                placeholder="min"
+                value={yesMinFilter}
+                onChange={(e) => setYesMinFilter(e.target.value)}
+              />
+              <input
+                className="price-range-input"
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                placeholder="max"
+                value={yesMaxFilter}
+                onChange={(e) => setYesMaxFilter(e.target.value)}
+              />
+            </label>
+            <label className="price-range-control">
+              <span>NO</span>
+              <input
+                className="price-range-input"
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                placeholder="min"
+                value={noMinFilter}
+                onChange={(e) => setNoMinFilter(e.target.value)}
+              />
+              <input
+                className="price-range-input"
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                placeholder="max"
+                value={noMaxFilter}
+                onChange={(e) => setNoMaxFilter(e.target.value)}
+              />
+            </label>
+          </div>
+        </details>
         <span className="results-count">
           {visibleMarkets.length} of {filteredMarkets.length} shown
         </span>
@@ -1079,6 +1206,93 @@ export default function App() {
             {option.label}
           </button>
         ))}
+      </section>
+      <section className="analytics-board">
+        <div className="stream-header analytics-head">
+          <div>
+            <p className="eyebrow">Analytics Dashboard</p>
+            <h3>{activeCategoryLabel} Flow Snapshot</h3>
+          </div>
+          <span className="pill">Last 48h large trades + current market snapshot</span>
+        </div>
+        <div className="analytics-grid">
+          <article className="analytics-card">
+            <span className="label">Filtered Markets</span>
+            <span className="value">{analytics.marketCount}</span>
+            <span className="label">Hot in last {ALERT_RECENT_MIN}m: {analytics.hotMarketCount}</span>
+          </article>
+          <article className="analytics-card">
+            <span className="label">Liquidity in View</span>
+            <span className="value">{fmtNumber(analytics.totalLiquidity)}</span>
+            <span className="label">24h volume: {fmtNumber(analytics.totalVolume24h)}</span>
+          </article>
+          <article className="analytics-card">
+            <span className="label">Large Trade Flow</span>
+            <span className="value">{fmtNumber(analytics.totalLargeTradeNotional)} USDC</span>
+            <span className="label">
+              BUY {fmtNumber(analytics.sideBreakdown.buy)} / SELL {fmtNumber(analytics.sideBreakdown.sell)}
+            </span>
+          </article>
+          <article className="analytics-card">
+            <span className="label">Largest Print</span>
+            <span className="value">{fmtNumber(analytics.largestTrade?.notional || 0)} USDC</span>
+            <span className="label truncate">
+              {analytics.largestTrade?.question || "No qualifying trades in this view"}
+            </span>
+          </article>
+        </div>
+        <div className="analytics-columns">
+          <div className="analytics-card">
+            <div className="stream-header">
+              <h4>Trade Leaders</h4>
+              <span>{analytics.tradeLeaders.length}</span>
+            </div>
+            <div className="stream-list">
+              {analytics.tradeLeaders.length === 0 && (
+                <div className="stream-empty">No qualifying large-trade flow in this filter yet.</div>
+              )}
+              {analytics.tradeLeaders.map((leader) => (
+                <div className="analytics-row" key={leader.marketId}>
+                  <span className="truncate">{leader.question}</span>
+                  <span className="mono">{fmtNumber(leader.totalNotional)} USDC</span>
+                  <span className="mono">{leader.tradeCount} trades</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="analytics-card">
+            <div className="stream-header">
+              <h4>Outcome Flow</h4>
+              <span>{analytics.outcomeLeaders.length}</span>
+            </div>
+            <div className="stream-list">
+              {analytics.outcomeLeaders.length === 0 && (
+                <div className="stream-empty">Outcome-level flow will appear once trades qualify.</div>
+              )}
+              {analytics.outcomeLeaders.map((entry) => (
+                <div className="analytics-row" key={entry.outcome}>
+                  <span>{entry.outcome}</span>
+                  <span className="mono">{fmtNumber(entry.notional)} USDC</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="analytics-card">
+            <div className="stream-header">
+              <h4>Volume Leaders</h4>
+              <span>{analytics.volumeLeaders.length}</span>
+            </div>
+            <div className="stream-list">
+              {analytics.volumeLeaders.map((leader) => (
+                <div className="analytics-row" key={leader.marketId}>
+                  <span className="truncate">{leader.question}</span>
+                  <span className="mono">{fmtNumber(leader.volume24hr)} vol</span>
+                  <span className="mono">{fmtNumber(leader.liquidity)} liq</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </section>
       {authToken && (
         <section className="wallet-panel">

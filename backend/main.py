@@ -296,6 +296,115 @@ def _wallet_link_message(email: str, wallet_address: str, nonce: str) -> str:
     )
 
 
+def _serialize_market(m: dict) -> dict:
+    category, category_slug = _extract_market_category(m)
+    return {
+        "id": m.get("id"),
+        "question": m.get("question") or m.get("title"),
+        "volume24hr": float(m.get("volume24hr", 0) or 0),
+        "liquidity": float(m.get("liquidity", 0) or 0),
+        "endDate": m.get("endDate"),
+        "outcomes": m.get("outcomes"),
+        "outcomePrices": m.get("outcomePrices"),
+        "clobTokenIds": m.get("clobTokenIds"),
+        "conditionId": m.get("conditionId") or m.get("condition_id"),
+        "category": category,
+        "categorySlug": category_slug,
+    }
+
+
+def _build_analytics_snapshot(markets: list[dict], trades: list[dict], recent_minutes: int = 15) -> dict:
+    now = datetime.now(timezone.utc)
+    latest_trade_by_market = {}
+    for trade in trades:
+        market_id = str(trade.get("market_id") or "")
+        if not market_id or market_id in latest_trade_by_market:
+            continue
+        latest_trade_by_market[market_id] = trade
+
+    hot_market_count = 0
+    for market in markets:
+        key = str(market.get("conditionId") or market.get("id") or "")
+        latest = latest_trade_by_market.get(key)
+        if not latest:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(latest.get("timestamp") or "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        age_minutes = (now - ts).total_seconds() / 60
+        if age_minutes <= recent_minutes:
+            hot_market_count += 1
+
+    total_liquidity = sum(float(market.get("liquidity") or 0) for market in markets)
+    total_volume24h = sum(float(market.get("volume24hr") or 0) for market in markets)
+    total_large_trade_notional = sum(float(trade.get("notional") or 0) for trade in trades)
+    largest_trade = max(trades, key=lambda trade: float(trade.get("notional") or 0), default=None)
+
+    side_breakdown = {"buy": 0.0, "sell": 0.0}
+    outcome_leaders: dict[str, float] = {}
+    trade_leaders: dict[str, dict] = {}
+
+    for trade in trades:
+        notional = float(trade.get("notional") or 0)
+        side = str(trade.get("side") or "").upper()
+        if side == "BUY":
+            side_breakdown["buy"] += notional
+        elif side == "SELL":
+            side_breakdown["sell"] += notional
+
+        outcome = str(trade.get("outcome") or "Unknown")
+        outcome_leaders[outcome] = outcome_leaders.get(outcome, 0.0) + notional
+
+        market_id = str(trade.get("market_id") or trade.get("question") or "unknown")
+        current = trade_leaders.get(market_id) or {
+            "marketId": market_id,
+            "question": trade.get("question") or "Unknown market",
+            "tradeCount": 0,
+            "totalNotional": 0.0,
+            "largestNotional": 0.0,
+        }
+        current["tradeCount"] += 1
+        current["totalNotional"] += notional
+        current["largestNotional"] = max(current["largestNotional"], notional)
+        trade_leaders[market_id] = current
+
+    volume_leaders = sorted(
+        [
+            {
+                "marketId": str(market.get("conditionId") or market.get("id") or market.get("question") or "unknown"),
+                "question": market.get("question") or "Unknown market",
+                "volume24hr": float(market.get("volume24hr") or 0),
+                "liquidity": float(market.get("liquidity") or 0),
+                "category": market.get("category"),
+            }
+            for market in markets
+        ],
+        key=lambda item: (item["volume24hr"], item["liquidity"]),
+        reverse=True,
+    )[:5]
+
+    return {
+        "marketCount": len(markets),
+        "hotMarketCount": hot_market_count,
+        "totalLiquidity": total_liquidity,
+        "totalVolume24h": total_volume24h,
+        "totalLargeTradeNotional": total_large_trade_notional,
+        "largestTrade": largest_trade,
+        "sideBreakdown": side_breakdown,
+        "outcomeLeaders": [
+            {"outcome": outcome, "notional": notional}
+            for outcome, notional in sorted(outcome_leaders.items(), key=lambda item: item[1], reverse=True)[:4]
+        ],
+        "tradeLeaders": sorted(
+            trade_leaders.values(),
+            key=lambda item: (item["totalNotional"], item["tradeCount"]),
+            reverse=True,
+        )[:5],
+        "volumeLeaders": volume_leaders,
+    }
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     global db_pool
@@ -607,25 +716,49 @@ async def user_alerts_remove(market_id: str, user: dict = Depends(require_user))
 @app.get("/api/markets")
 async def markets() -> dict:
     snapshot = await cache.get_snapshot()
-    markets = []
-    for m in snapshot["markets"]:
-        category, category_slug = _extract_market_category(m)
-        markets.append({
-            "id": m.get("id"),
-            "question": m.get("question") or m.get("title"),
-            "volume24hr": float(m.get("volume24hr", 0) or 0),
-            "liquidity": float(m.get("liquidity", 0) or 0),
-            "endDate": m.get("endDate"),
-            "outcomes": m.get("outcomes"),
-            "outcomePrices": m.get("outcomePrices"),
-            "clobTokenIds": m.get("clobTokenIds"),
-            "conditionId": m.get("conditionId") or m.get("condition_id"),
-            "category": category,
-            "categorySlug": category_slug,
-        })
+    markets = [_serialize_market(m) for m in snapshot["markets"]]
     return {
         "updated_at": datetime.utcnow().isoformat() + "Z",
         "markets": markets,
+    }
+
+
+@app.get("/api/analytics/overview")
+async def analytics_overview(
+    category: str | None = Query(default=None),
+    min_notional: float = Query(default=5000, ge=0),
+    trade_limit: int = Query(default=250, ge=10, le=1000),
+) -> dict:
+    snapshot = await cache.get_snapshot()
+    markets = [_serialize_market(m) for m in snapshot["markets"]]
+
+    normalized_category = (category or "").strip().lower()
+    if normalized_category and normalized_category != "__all__":
+        markets = [
+            market for market in markets
+            if str(market.get("categorySlug") or market.get("category") or "").strip().lower() == normalized_category
+        ]
+
+    market_ids = {
+        str(market.get("conditionId") or market.get("id") or "")
+        for market in markets
+        if market.get("conditionId") or market.get("id")
+    }
+
+    trades = []
+    if db_pool is not None and get_recent_large_trades is not None:
+        trades = await get_recent_large_trades(db_pool, limit=trade_limit)
+        trades = [trade for trade in trades if float(trade.get("notional") or 0) >= min_notional]
+        if market_ids:
+            trades = [trade for trade in trades if str(trade.get("market_id") or "") in market_ids]
+        else:
+            trades = []
+
+    return {
+        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "category": normalized_category or "__all__",
+        "min_notional": min_notional,
+        "analytics": _build_analytics_snapshot(markets, trades),
     }
 
 
