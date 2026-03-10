@@ -152,6 +152,7 @@ export default function App() {
   const [markets, setMarkets] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedCategory, setSelectedCategory] = useState(ALL_CATEGORIES);
+  const [excludedCategoryKeys, setExcludedCategoryKeys] = useState([]);
   const [updatedAt, setUpdatedAt] = useState(null);
   const [wsStatus, setWsStatus] = useState("connecting");
   const [largeTrades, setLargeTrades] = useState([]);
@@ -239,7 +240,7 @@ export default function App() {
 
   useEffect(() => {
     setVisibleCount(MARKET_PAGE_SIZE);
-  }, [searchQuery, selectedCategory, yesMinFilter, yesMaxFilter, noMinFilter, noMaxFilter]);
+  }, [excludedCategoryKeys, noMaxFilter, noMinFilter, searchQuery, selectedCategory, yesMaxFilter, yesMinFilter]);
 
   useEffect(() => {
     let cancelled = false;
@@ -517,9 +518,16 @@ export default function App() {
   }, [enrichedMarkets]);
 
   const marketsByCategory = useMemo(() => {
-    if (selectedCategory === ALL_CATEGORIES) return enrichedMarkets;
-    return enrichedMarkets.filter((market) => market.categoryKey === selectedCategory);
-  }, [enrichedMarkets, selectedCategory]);
+    return enrichedMarkets.filter((market) => {
+      if (selectedCategory !== ALL_CATEGORIES && market.categoryKey !== selectedCategory) {
+        return false;
+      }
+      if (market.categoryKey && excludedCategoryKeys.includes(market.categoryKey)) {
+        return false;
+      }
+      return true;
+    });
+  }, [enrichedMarkets, excludedCategoryKeys, selectedCategory]);
 
   const activeCategoryLabel = useMemo(() => {
     if (selectedCategory === ALL_CATEGORIES) return "All";
@@ -535,6 +543,11 @@ export default function App() {
     });
     return map;
   }, [enrichedMarkets]);
+  const excludedCategoryLabels = useMemo(() => {
+    return categoryOptions
+      .filter((option) => excludedCategoryKeys.includes(option.key))
+      .map((option) => option.label);
+  }, [categoryOptions, excludedCategoryKeys]);
 
   const filteredLargeTrades = useMemo(() => {
     return qualifiedLargeTrades.filter((trade) => {
@@ -548,8 +561,9 @@ export default function App() {
     });
   }, [marketCategoryById, noMaxFilter, noMinFilter, qualifiedLargeTrades, selectedCategory, yesMaxFilter, yesMinFilter]);
   const analytics = useMemo(() => {
-    return serverAnalytics || buildAnalyticsSnapshot(marketsByCategory, filteredLargeTrades, ALERT_RECENT_MIN);
-  }, [filteredLargeTrades, marketsByCategory, serverAnalytics]);
+    const canUseServerAnalytics = excludedCategoryKeys.length === 0;
+    return (canUseServerAnalytics ? serverAnalytics : null) || buildAnalyticsSnapshot(marketsByCategory, filteredLargeTrades, ALERT_RECENT_MIN);
+  }, [excludedCategoryKeys.length, filteredLargeTrades, marketsByCategory, serverAnalytics]);
 
   const alertMatches = useMemo(() => {
     if (!authToken) return [];
@@ -840,6 +854,14 @@ export default function App() {
     setLinkedWallets(Array.isArray(data.wallets) ? data.wallets : []);
   }
 
+  function toggleExcludedCategory(categoryKey) {
+    setExcludedCategoryKeys((prev) => (
+      prev.includes(categoryKey)
+        ? prev.filter((key) => key !== categoryKey)
+        : [...prev, categoryKey]
+    ));
+  }
+
   const ensureTradingClient = useCallback(async () => {
     if (!authToken) {
       navigate("/login");
@@ -1020,6 +1042,10 @@ export default function App() {
     let cancelled = false;
 
     async function fetchAnalytics() {
+      if (excludedCategoryKeys.length > 0) {
+        setServerAnalytics(null);
+        return;
+      }
       try {
         const params = new URLSearchParams({
           category: selectedCategory,
@@ -1043,7 +1069,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [authToken, minLargeTradeUsdc, selectedCategory]);
+  }, [authToken, excludedCategoryKeys.length, minLargeTradeUsdc, selectedCategory]);
 
   useEffect(() => {
     if (!tradingClient || !selectedMarket || !selectedTradingToken) return;
@@ -1119,71 +1145,6 @@ export default function App() {
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
         />
-        <details className="advanced-search">
-          <summary>Advanced Search</summary>
-          <div className="advanced-search-note">
-            These filters narrow the large-trade feed
-          </div>
-          <div className="advanced-search-grid">
-            <label className="min-usdc-control">
-              <span>Min large trade (USDC)</span>
-              <input
-                className="min-usdc-input"
-                type="number"
-                min="0"
-                step="100"
-                value={minLargeTradeUsdc}
-                onChange={(e) => setMinLargeTradeUsdc(Math.max(0, Number(e.target.value || 0)))}
-              />
-            </label>
-            <label className="price-range-control">
-              <span>YES</span>
-              <input
-                className="price-range-input"
-                type="number"
-                min="0"
-                max="1"
-                step="0.01"
-                placeholder="min"
-                value={yesMinFilter}
-                onChange={(e) => setYesMinFilter(e.target.value)}
-              />
-              <input
-                className="price-range-input"
-                type="number"
-                min="0"
-                max="1"
-                step="0.01"
-                placeholder="max"
-                value={yesMaxFilter}
-                onChange={(e) => setYesMaxFilter(e.target.value)}
-              />
-            </label>
-            <label className="price-range-control">
-              <span>NO</span>
-              <input
-                className="price-range-input"
-                type="number"
-                min="0"
-                max="1"
-                step="0.01"
-                placeholder="min"
-                value={noMinFilter}
-                onChange={(e) => setNoMinFilter(e.target.value)}
-              />
-              <input
-                className="price-range-input"
-                type="number"
-                min="0"
-                max="1"
-                step="0.01"
-                placeholder="max"
-                value={noMaxFilter}
-                onChange={(e) => setNoMaxFilter(e.target.value)}
-              />
-            </label>
-          </div>
-        </details>
         <span className="results-count">
           {visibleMarkets.length} of {filteredMarkets.length} shown
         </span>
@@ -1207,14 +1168,94 @@ export default function App() {
           </button>
         ))}
       </section>
-      <section className="analytics-board">
-        <div className="stream-header analytics-head">
+      <details className="advanced-search">
+        <summary>Filter Large Trades</summary>
+        <div className="advanced-search-note">
+          These filters narrow the large-trade feed
+        </div>
+        <div className="advanced-search-section">
+          <span className="label">Exclude market types</span>
+          <div className="advanced-search-chips">
+            {categoryOptions.map((option) => (
+              <button
+                key={`exclude-${option.key}`}
+                type="button"
+                className={`filter-chip ${excludedCategoryKeys.includes(option.key) ? "active" : ""}`}
+                onClick={() => toggleExcludedCategory(option.key)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="advanced-search-grid">
+          <label className="min-usdc-control">
+            <span>Min large trade (USDC)</span>
+            <input
+              className="min-usdc-input"
+              type="number"
+              min="0"
+              step="100"
+              value={minLargeTradeUsdc}
+              onChange={(e) => setMinLargeTradeUsdc(Math.max(0, Number(e.target.value || 0)))}
+            />
+          </label>
+          <label className="price-range-control">
+            <span>YES</span>
+            <input
+              className="price-range-input"
+              type="number"
+              min="0"
+              max="1"
+              step="0.01"
+              placeholder="min"
+              value={yesMinFilter}
+              onChange={(e) => setYesMinFilter(e.target.value)}
+            />
+            <input
+              className="price-range-input"
+              type="number"
+              min="0"
+              max="1"
+              step="0.01"
+              placeholder="max"
+              value={yesMaxFilter}
+              onChange={(e) => setYesMaxFilter(e.target.value)}
+            />
+          </label>
+          <label className="price-range-control">
+            <span>NO</span>
+            <input
+              className="price-range-input"
+              type="number"
+              min="0"
+              max="1"
+              step="0.01"
+              placeholder="min"
+              value={noMinFilter}
+              onChange={(e) => setNoMinFilter(e.target.value)}
+            />
+            <input
+              className="price-range-input"
+              type="number"
+              min="0"
+              max="1"
+              step="0.01"
+              placeholder="max"
+              value={noMaxFilter}
+              onChange={(e) => setNoMaxFilter(e.target.value)}
+            />
+          </label>
+        </div>
+      </details>
+      <details className="analytics-board" open>
+        <summary className="collapsible-summary">
           <div>
             <p className="eyebrow">Analytics Dashboard</p>
             <h3>{activeCategoryLabel} Flow Snapshot</h3>
           </div>
           <span className="pill">Last 48h large trades + current market snapshot</span>
-        </div>
+        </summary>
         <div className="analytics-grid">
           <article className="analytics-card">
             <span className="label">Filtered Markets</span>
@@ -1293,14 +1334,21 @@ export default function App() {
             </div>
           </div>
         </div>
-      </section>
+      </details>
       {authToken && (
-        <section className="wallet-panel">
-          <div className="stream-header">
+        <details className="wallet-panel" open>
+          <summary className="collapsible-summary">
             <h3>Linked Wallets</h3>
-            <button className="btn" type="button" onClick={connectAndLinkWallet} disabled={walletLoading}>
+            <button className="btn" type="button" onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              connectAndLinkWallet();
+            }} disabled={walletLoading}>
               {walletLoading ? "Connecting..." : "Connect Wallet"}
             </button>
+          </summary>
+          <div className="micro-disclaimer">
+            Wallet connection and trading features are still experimental.
           </div>
           {walletError && <div className="history-error">{walletError}</div>}
           <div className="stream-list">
@@ -1330,7 +1378,7 @@ export default function App() {
               </div>
             ))}
           </div>
-        </section>
+        </details>
       )}
 
       {selectedMarket && (
@@ -1745,6 +1793,9 @@ export default function App() {
           <span>{filteredLargeTrades.length} events</span>
         </div>
         <div className="active-filter">Active filter: {activeCategoryLabel}</div>
+        {excludedCategoryLabels.length > 0 && (
+          <div className="active-filter">Excluded: {excludedCategoryLabels.join(", ")}</div>
+        )}
         {authToken && (
           <div className="active-filter">Alert matches: {alertMatches.length}</div>
         )}
@@ -1796,6 +1847,14 @@ export default function App() {
           </div>
         </section>
       )}
+      <footer className="page-footer">
+        <span>Polymarket Watch</span>
+        <span>Live analytics, large-trade monitoring, and trading tools.</span>
+        <span>Contact Us: polywatchsupport@gmail.com</span>
+        <span className="micro-disclaimer">
+          Disclaimer: This site is for informational purposes only and does not provide financial advice.
+        </span>
+      </footer>
     </div>
   );
 }

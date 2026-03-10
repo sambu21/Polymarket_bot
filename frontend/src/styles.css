@@ -113,11 +113,14 @@ h1 {
 }
 
 .advanced-search {
+  margin-top: 12px;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.04);
   color: var(--muted);
   padding: 10px 12px;
+  width: fit-content;
+  max-width: 100%;
 }
 
 .advanced-search summary {
@@ -140,6 +143,18 @@ h1 {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.4;
+}
+
+.advanced-search-section {
+  margin-bottom: 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.advanced-search-chips {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .advanced-search-grid {
@@ -365,6 +380,24 @@ h1 {
     linear-gradient(180deg, rgba(38, 194, 160, 0.08), rgba(255, 255, 255, 0.03)),
     var(--card);
   padding: 18px 22px;
+}
+
+.collapsible-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.collapsible-summary::-webkit-details-marker {
+  display: none;
+}
+
+.analytics-board[open] .collapsible-summary,
+.wallet-panel[open] .collapsible-summary {
+  margin-bottom: 14px;
 }
 
 .analytics-head h3 {
@@ -644,6 +677,24 @@ h1 {
 .stream-empty {
   color: var(--muted);
   padding: 12px 0;
+}
+
+.page-footer {
+  margin-top: 32px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.micro-disclaimer {
+  font-size: 10px;
+  line-height: 1.4;
+  color: rgba(180, 188, 203, 0.78);
 }
 
 .mono {
