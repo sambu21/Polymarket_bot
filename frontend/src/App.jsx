@@ -240,7 +240,7 @@ export default function App() {
 
   useEffect(() => {
     setVisibleCount(MARKET_PAGE_SIZE);
-  }, [excludedCategoryKeys, noMaxFilter, noMinFilter, searchQuery, selectedCategory, yesMaxFilter, yesMinFilter]);
+  }, [noMaxFilter, noMinFilter, searchQuery, selectedCategory, yesMaxFilter, yesMinFilter]);
 
   useEffect(() => {
     let cancelled = false;
@@ -522,12 +522,9 @@ export default function App() {
       if (selectedCategory !== ALL_CATEGORIES && market.categoryKey !== selectedCategory) {
         return false;
       }
-      if (market.categoryKey && excludedCategoryKeys.includes(market.categoryKey)) {
-        return false;
-      }
       return true;
     });
-  }, [enrichedMarkets, excludedCategoryKeys, selectedCategory]);
+  }, [enrichedMarkets, selectedCategory]);
 
   const activeCategoryLabel = useMemo(() => {
     if (selectedCategory === ALL_CATEGORIES) return "All";
@@ -551,15 +548,18 @@ export default function App() {
 
   const filteredLargeTrades = useMemo(() => {
     return qualifiedLargeTrades.filter((trade) => {
+      const tradeCategory = marketCategoryById.get(String(trade.market_id || ""));
       if (selectedCategory !== ALL_CATEGORIES) {
-        const tradeCategory = marketCategoryById.get(String(trade.market_id || ""));
         if (tradeCategory !== selectedCategory) {
           return false;
         }
       }
+      if (tradeCategory && excludedCategoryKeys.includes(tradeCategory)) {
+        return false;
+      }
       return tradeMatchesOutcomePriceFilters(trade, yesMinFilter, yesMaxFilter, noMinFilter, noMaxFilter);
     });
-  }, [marketCategoryById, noMaxFilter, noMinFilter, qualifiedLargeTrades, selectedCategory, yesMaxFilter, yesMinFilter]);
+  }, [excludedCategoryKeys, marketCategoryById, noMaxFilter, noMinFilter, qualifiedLargeTrades, selectedCategory, yesMaxFilter, yesMinFilter]);
   const analytics = useMemo(() => {
     const canUseServerAnalytics = excludedCategoryKeys.length === 0;
     return (canUseServerAnalytics ? serverAnalytics : null) || buildAnalyticsSnapshot(marketsByCategory, filteredLargeTrades, ALERT_RECENT_MIN);
@@ -596,9 +596,13 @@ export default function App() {
       if (tradeNotional(trade) < minLargeTradeUsdc) {
         return false;
       }
+      const tradeCategory = marketCategoryById.get(String(trade.market_id || ""));
+      if (tradeCategory && excludedCategoryKeys.includes(tradeCategory)) {
+        return false;
+      }
       return tradeMatchesOutcomePriceFilters(trade, yesMinFilter, yesMaxFilter, noMinFilter, noMaxFilter);
     });
-  }, [minLargeTradeUsdc, noMaxFilter, noMinFilter, selectedHistory, yesMaxFilter, yesMinFilter]);
+  }, [excludedCategoryKeys, marketCategoryById, minLargeTradeUsdc, noMaxFilter, noMinFilter, selectedHistory, yesMaxFilter, yesMinFilter]);
 
   const loadMarketHistory = useCallback(async (marketId, append = false) => {
     if (!marketId) return;
