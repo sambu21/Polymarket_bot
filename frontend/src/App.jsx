@@ -197,6 +197,11 @@ export default function App() {
     size: DEFAULT_ORDER_SIZE,
   });
 
+  function invalidateSession() {
+    clearAuthToken();
+    window.location.reload();
+  }
+
   useEffect(() => {
     let isMounted = true;
 
@@ -265,6 +270,17 @@ export default function App() {
           fetch(`${API_BASE}/api/user/wallets`, { headers }),
         ]);
         if (cancelled) return;
+
+        if (
+          meRes.status === 401 ||
+          prefsRes.status === 401 ||
+          bookmarksRes.status === 401 ||
+          alertsRes.status === 401 ||
+          walletsRes.status === 401
+        ) {
+          invalidateSession();
+          return;
+        }
 
         if (meRes.ok) {
           setUserProfile(await meRes.json());
@@ -444,12 +460,13 @@ export default function App() {
   useEffect(() => {
     let ws;
     let stopped = false;
+    let connectTimer;
 
     function connect() {
+      if (stopped) return;
       setWsStatus("connecting");
       const wsBase = API_BASE.replace(/^http/, "ws");
-      const suffix = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
-      ws = new WebSocket(`${wsBase}/ws/large-trades${suffix}`);
+      ws = new WebSocket(`${wsBase}/ws/large-trades`);
 
       ws.onopen = () => {
         setWsStatus("live");
@@ -492,10 +509,15 @@ export default function App() {
       };
     }
 
-    connect();
+    // Delay connection so StrictMode's dev-only mount/unmount cycle can
+    // cancel the first pass before a socket is opened.
+    connectTimer = window.setTimeout(connect, 0);
 
     return () => {
       stopped = true;
+      if (connectTimer) {
+        window.clearTimeout(connectTimer);
+      }
       if (ws) ws.close();
     };
   }, [authToken]);
@@ -1121,10 +1143,7 @@ export default function App() {
               <button
                 type="button"
                 className="btn"
-                onClick={() => {
-                  clearAuthToken();
-                  window.location.reload();
-                }}
+                onClick={invalidateSession}
               >
                 Logout
               </button>

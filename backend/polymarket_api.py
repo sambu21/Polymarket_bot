@@ -49,15 +49,18 @@ def _is_open_market(market: dict, now: datetime) -> bool:
     return True
 
 
-async def fetch_top_markets(client: httpx.AsyncClient) -> List[dict]:
+async def fetch_markets(client: httpx.AsyncClient, limit: int | None = None) -> List[dict]:
     now = datetime.now(timezone.utc)
     collected: List[dict] = []
     seen_ids = set()
-    page_size = min(100, max(20, TOP_N))
+    if limit is None:
+        page_size = 100
+    else:
+        page_size = min(100, max(20, limit))
     offset = 0
 
     # Gamma is often paginated; keep fetching until we have enough.
-    while len(collected) < TOP_N:
+    while limit is None or len(collected) < limit:
         r = await client.get(
             GAMMA_API_URL,
             params={
@@ -86,7 +89,7 @@ async def fetch_top_markets(client: httpx.AsyncClient) -> List[dict]:
                 if market_id:
                     seen_ids.add(market_id)
                 added_this_page += 1
-                if len(collected) >= TOP_N:
+                if limit is not None and len(collected) >= limit:
                     break
 
         # Stop if we reached the end or got no usable additions.
@@ -100,7 +103,17 @@ async def fetch_top_markets(client: httpx.AsyncClient) -> List[dict]:
         key=lambda m: float(m.get("volume24hr", 0) or 0),
         reverse=True,
     )
-    return markets[:TOP_N]
+    if limit is None:
+        return markets
+    return markets[:limit]
+
+
+async def fetch_top_markets(client: httpx.AsyncClient, limit: int | None = None) -> List[dict]:
+    return await fetch_markets(client, TOP_N if limit is None else limit)
+
+
+async def fetch_all_markets(client: httpx.AsyncClient) -> List[dict]:
+    return await fetch_markets(client, limit=None)
 
 
 def extract_tokens_from_gamma(market: dict) -> List[dict]:

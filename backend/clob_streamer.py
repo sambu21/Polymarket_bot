@@ -14,8 +14,8 @@ except Exception:
 
 from .polymarket_api import (
     extract_tokens_from_gamma,
+    fetch_all_markets,
     fetch_tokens_from_clob,
-    fetch_top_markets,
 )
 
 CLOB_WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -26,6 +26,7 @@ WINDOW_SIZE = int(os.getenv("TRADE_SIZE_WINDOW", "50"))
 MULTIPLIER = float(os.getenv("TRADE_SIZE_MULTIPLIER", "6"))
 
 MARKET_REFRESH_SECONDS = int(os.getenv("MARKET_REFRESH_SECONDS", "60"))
+TRADE_STREAM_MARKET_LIMIT = max(0, int(os.getenv("TRADE_TOP_N", "500")))
 
 
 class TokenMapCache:
@@ -37,10 +38,11 @@ class TokenMapCache:
     async def update(self) -> None:
         async with self._lock:
             async with httpx.AsyncClient(timeout=15) as client:
-                markets = await fetch_top_markets(client)
+                markets = await fetch_all_markets(client)
+                stream_markets = markets if TRADE_STREAM_MARKET_LIMIT == 0 else markets[:TRADE_STREAM_MARKET_LIMIT]
                 token_map: Dict[str, dict] = {}
 
-                for market in markets:
+                for market in stream_markets:
                     question = market.get("question") or market.get("title") or "Unknown market"
                     condition_id = market.get("conditionId") or market.get("condition_id")
 
