@@ -5,8 +5,6 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Set
 
-from eth_account import Account
-from eth_account.messages import encode_defunct
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -624,6 +622,12 @@ async def user_wallets_challenge(payload: WalletChallengePayload, user: dict = D
 async def user_wallets_verify(payload: WalletVerifyPayload, user: dict = Depends(require_user)) -> dict:
     if db_pool is None or consume_wallet_nonce is None or link_user_wallet is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
+
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+    except Exception:
+        raise HTTPException(status_code=503, detail="Wallet verification unavailable")
 
     wallet_address = _normalize_wallet_address(payload.wallet_address)
     nonce = (payload.nonce or "").strip()
