@@ -71,6 +71,7 @@ AUTH_EXPIRE_HOURS = int(os.getenv("AUTH_EXPIRE_HOURS", "168"))
 LARGE_TRADE_RETENTION_HOURS = int(os.getenv("LARGE_TRADE_RETENTION_HOURS", "48"))
 LARGE_TRADE_CLEANUP_SECONDS = int(os.getenv("LARGE_TRADE_CLEANUP_SECONDS", "600"))
 WALLET_NONCE_TTL_SECONDS = int(os.getenv("WALLET_NONCE_TTL_SECONDS", "600"))
+MIN_MARKET_VOLUME_24H = float(os.getenv("MIN_MARKET_VOLUME_24H", "50000"))
 
 app = FastAPI(title="Polymarket Monitor API")
 app.add_middleware(
@@ -311,6 +312,13 @@ def _serialize_market(m: dict) -> dict:
         "category": category,
         "categorySlug": category_slug,
     }
+
+
+def _filter_markets_by_volume(markets: list[dict]) -> list[dict]:
+    return [
+        market for market in markets
+        if float(market.get("volume24hr") or 0) >= MIN_MARKET_VOLUME_24H
+    ]
 
 
 def _build_analytics_snapshot(markets: list[dict], trades: list[dict], recent_minutes: int = 15) -> dict:
@@ -716,7 +724,7 @@ async def user_alerts_remove(market_id: str, user: dict = Depends(require_user))
 @app.get("/api/markets")
 async def markets() -> dict:
     snapshot = await cache.get_snapshot()
-    markets = [_serialize_market(m) for m in snapshot["markets"]]
+    markets = _filter_markets_by_volume([_serialize_market(m) for m in snapshot["markets"]])
     return {
         "updated_at": datetime.utcnow().isoformat() + "Z",
         "markets": markets,
@@ -730,7 +738,7 @@ async def analytics_overview(
     trade_limit: int = Query(default=250, ge=10, le=1000),
 ) -> dict:
     snapshot = await cache.get_snapshot()
-    markets = [_serialize_market(m) for m in snapshot["markets"]]
+    markets = _filter_markets_by_volume([_serialize_market(m) for m in snapshot["markets"]])
 
     normalized_category = (category or "").strip().lower()
     if normalized_category and normalized_category != "__all__":

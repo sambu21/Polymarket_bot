@@ -72,7 +72,7 @@ async def test_analytics_overview_filters_category_and_trades(monkeypatch):
                 {
                     "id": "m1",
                     "question": "Politics market",
-                    "volume24hr": 1000,
+                    "volume24hr": 51000,
                     "liquidity": 500,
                     "conditionId": "m1",
                     "category": "Politics",
@@ -81,7 +81,7 @@ async def test_analytics_overview_filters_category_and_trades(monkeypatch):
                 {
                     "id": "m2",
                     "question": "Sports market",
-                    "volume24hr": 2000,
+                    "volume24hr": 52000,
                     "liquidity": 900,
                     "conditionId": "m2",
                     "category": "Sports",
@@ -108,3 +108,39 @@ async def test_analytics_overview_filters_category_and_trades(monkeypatch):
     assert response["analytics"]["marketCount"] == 1
     assert response["analytics"]["totalLargeTradeNotional"] == 9000
     assert response["analytics"]["tradeLeaders"][0]["marketId"] == "m1"
+
+
+@pytest.mark.asyncio
+async def test_markets_filters_out_low_volume_entries(monkeypatch):
+    async def fake_snapshot():
+        return {
+            "markets": [
+                {
+                    "id": "m1",
+                    "question": "Low volume market",
+                    "volume24hr": 49999,
+                    "liquidity": 500,
+                    "conditionId": "m1",
+                },
+                {
+                    "id": "m2",
+                    "question": "Threshold market",
+                    "volume24hr": 50000,
+                    "liquidity": 900,
+                    "conditionId": "m2",
+                },
+                {
+                    "id": "m3",
+                    "question": "High volume market",
+                    "volume24hr": 75000,
+                    "liquidity": 1200,
+                    "conditionId": "m3",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(main.cache, "get_snapshot", fake_snapshot)
+
+    response = await main.markets()
+
+    assert [market["id"] for market in response["markets"]] == ["m2", "m3"]
